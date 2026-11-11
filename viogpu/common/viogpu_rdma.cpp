@@ -14,7 +14,7 @@ extern "C"
 
 /* ---- pVM test build: a log in the registry (no debugger, no WPP decoding on the guest) ---- */
 #define VIOGPU_REGLOG_BYTES (96 * 1024)
-#define VIOGPU_REGLOG_FLUSH_MS 250
+#define VIOGPU_REGLOG_FLUSH_MS 1 /* test build: (nearly) every logged line reaches the registry */
 static char g_Log[VIOGPU_REGLOG_BYTES];
 static char g_LogFlush[VIOGPU_REGLOG_BYTES];
 static ULONG g_LogLen = 0;
