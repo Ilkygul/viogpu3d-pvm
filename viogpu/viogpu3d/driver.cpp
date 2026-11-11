@@ -291,7 +291,8 @@ VioGpu3DAddDevice(_In_ DEVICE_OBJECT *pPhysicalDeviceObject, _Outptr_ PVOID *ppD
 
     *ppDeviceContext = pAdapter->ToHandle();
 
-    VioGpuInstallDisplayFixup(pPhysicalDeviceObject);
+    // pVM bring-up: no boot framebuffer resource on DroidVM; suspect for dxgkrnl AddDevice 0xC0000182
+    // VioGpuInstallDisplayFixup(pPhysicalDeviceObject);
 
     DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s ppDeviceContext = %p\n", __FUNCTION__, pAdapter));
     return STATUS_SUCCESS;

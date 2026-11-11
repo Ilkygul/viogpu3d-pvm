@@ -22,6 +22,31 @@ static ULONG64 g_LogLastFlushMs = 0;
 static KSPIN_LOCK g_LogLock;
 static LONG g_LogLockInit = 0;
 
+/* One value per driver load (DbgLog0..3, round robin; DbgLogSeq holds the last index): a failed
+ * StartDevice is followed by another load whose log would otherwise overwrite the interesting one. */
+static WCHAR g_LogName[16] = L"DbgLog";
+static BOOLEAN g_LogNamed = FALSE;
+
+static void RegLogPickName(void)
+{
+    ULONG seq = 0, def = 0;
+    RTL_QUERY_REGISTRY_TABLE q[2];
+    RtlZeroMemory(q, sizeof(q));
+    q[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    q[0].Name = (PWSTR)L"DbgLogSeq";
+    q[0].EntryContext = &seq;
+    q[0].DefaultType = (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD;
+    q[0].DefaultData = &def;
+    q[0].DefaultLength = sizeof(def);
+    if (!NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, L"VioGpu3D", q, NULL, NULL)))
+    {
+        seq = 0;
+    }
+    seq = (seq + 1) % 4;
+    RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, L"VioGpu3D", L"DbgLogSeq", REG_DWORD, &seq, sizeof(seq));
+    RtlStringCbPrintfW(g_LogName, sizeof(g_LogName), L"DbgLog%u", seq);
+}
+
 static void RegLogWrite(BOOLEAN force)
 {
     KIRQL irql;
@@ -29,6 +54,11 @@ static void RegLogWrite(BOOLEAN force)
     if (KeGetCurrentIrql() != PASSIVE_LEVEL || g_LogLockInit != 2)
     {
         return;
+    }
+    if (!g_LogNamed)
+    {
+        g_LogNamed = TRUE;
+        RegLogPickName();
     }
     ULONG64 ms = KeQueryInterruptTime() / 10000;
     KeAcquireSpinLock(&g_LogLock, &irql);
@@ -41,7 +71,7 @@ static void RegLogWrite(BOOLEAN force)
     len = g_LogLen;
     RtlCopyMemory(g_LogFlush, g_Log, len);
     KeReleaseSpinLock(&g_LogLock, irql);
-    RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, L"VioGpu3D", L"DbgLog", REG_BINARY, g_LogFlush, len);
+    RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, L"VioGpu3D", g_LogName, REG_BINARY, g_LogFlush, len);
 }
 
 extern "C" void VioGpuRegLog(const char *fmt, ...)
