@@ -26,8 +26,19 @@
     void DebugPrintFuncSerial(const char *format, ...);
     void DebugPrintFuncKdPrint(const char *format, ...);
 #define DbgExpandArguments(...) __VA_ARGS__
+
+    // pVM test build: errors and fatals also go to the registry log
+    // (HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\DbgLog), which is readable without a debugger.
+    extern "C" void VioGpuRegLog(const char *fmt, ...);
+    __forceinline bool VioGpuRegLogOn(int level)
+    {
+        return level <= TRACE_LEVEL_ERROR;
+    }
 #define DbgPrint(Level, MSG) \
-    if (Level <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG);
+    { \
+        if ((Level) <= nDebugLevel) VirtioDebugPrintProc(DbgExpandArguments MSG); \
+        if (VioGpuRegLogOn(Level)) VioGpuRegLog MSG; \
+    }
 #define VioGpuDbgBreak()\
     if (KD_DEBUGGER_ENABLED && !KD_DEBUGGER_NOT_PRESENT && bBreakAlways) DbgBreakPoint();
 

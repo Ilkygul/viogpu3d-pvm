@@ -33,6 +33,7 @@
 #include "baseobj.h"
 #include "bitops.h"
 #include "viogpum.h"
+#include "viogpu_rdma.h"
 #include "viogpu_device.h"
 #if !DBG
 #include "viogpudo.tmh"
@@ -496,6 +497,9 @@ VioGpuAdapter::~VioGpuAdapter(void)
     KeFlushQueuedDpcs();
     VioGpuAdapterClose();
     HWClose();
+    // protected VM: the frame segment's pool region first, then everything else rdmapool lent us
+    frameSegment.Close();
+    VioGpuRdmaShutdown();
     ExDeleteNPagedLookasideList(&m_PresentFenceLookaside);
 
     // Gate entries: every armed entry's event-ring fence has completed by
@@ -3008,6 +3012,7 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
+    VioGpuRdmaReset(); /* protected VM: vrings and staging from the restricted DMA pool */
     if (IsHardwareInit())
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("Already Initialized\n"));

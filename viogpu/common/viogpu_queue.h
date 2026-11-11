@@ -68,6 +68,13 @@ typedef struct virtio_gpu_vbuffer
      * first fire may already have freed (bugcheck 0xA in
      * VioGpuWaitCtxCompleteCB). */
     LONG complete_fired;
+    /* protected VM: the shared-memory copy of command/data/response this buffer is queued with
+     * (NULL when staging is off or the buffer is not queued) */
+    void *stage_va;
+    ULONG stage_bytes;
+    ULONG stage_data_off;
+    ULONG stage_resp_off;
+    ULONGLONG stage_pa;
 } GPU_VBUFFER, *PGPU_VBUFFER;
 // #pragma pack()
 
@@ -145,6 +152,8 @@ class VioGpuMemSegment
   private:
     BOOLEAN m_bSystemMemory;
     BOOLEAN m_bMapped;
+    BOOLEAN m_bRdma;
+    PHYSICAL_ADDRESS m_RdmaPa;
     PSCATTER_GATHER_LIST m_pSGList;
     PVOID m_pVAddr;
     PMDL m_pMdl;

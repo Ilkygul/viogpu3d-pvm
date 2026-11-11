@@ -29,6 +29,7 @@
 
 #include "viogpu_queue.h"
 #include "baseobj.h"
+#include "viogpu_rdma.h"
 #if !DBG
 #include "viogpu_queue.tmh"
 #endif
@@ -41,6 +42,105 @@ static BOOLEAN BuildSGElement(VirtIOBufferDescriptor *sg, PVOID buf, ULONG size)
         sg->physAddr = MmGetPhysicalAddress(buf);
         return TRUE;
     }
+    return FALSE;
+}
+
+
+/* ---- protected VM: stage a vbuf's command, data and response in shared memory ----
+ * One contiguous staging run per vbuf: [command][data][response], each part 64-byte aligned.
+ * Staged exactly once before the descriptors are built; BuildVbufSGList (and so the resubmit of a
+ * parked vbuf) then points at the staged copy. The response is copied back by UnstageVbuf when the
+ * device returns the buffer. */
+#define STAGE_ALIGN(x) (((x) + 63u) & ~63u)
+
+static BOOLEAN StageVbuf(PGPU_VBUFFER buf)
+{
+    if (buf->stage_va != NULL)
+    {
+        return TRUE;
+    }
+    ULONG cmd = buf->size > 0 ? (ULONG)buf->size : 0;
+    ULONG data = buf->data_buf ? buf->data_size : 0;
+    ULONG resp = (buf->resp_size > 0 && buf->resp_buf) ? (ULONG)buf->resp_size : 0;
+    if (cmd + data + resp == 0)
+    {
+        return FALSE;
+    }
+    ULONG dataOff = STAGE_ALIGN(cmd);
+    ULONG respOff = dataOff + STAGE_ALIGN(data);
+    ULONGLONG total = (ULONGLONG)respOff + resp;
+    if (total > MAXULONG)
+    {
+        return FALSE;
+    }
+    PHYSICAL_ADDRESS pa;
+    PUCHAR va = (PUCHAR)VioGpuRdmaStageAlloc((SIZE_T)total, &pa);
+    if (va == NULL)
+    {
+        return FALSE;
+    }
+    if (cmd)
+    {
+        RtlCopyMemory(va, buf->buf, cmd);
+    }
+    if (data)
+    {
+        RtlCopyMemory(va + dataOff, buf->data_buf, data);
+    }
+    if (resp)
+    {
+        RtlZeroMemory(va + respOff, resp);
+    }
+    buf->stage_bytes = (ULONG)total;
+    buf->stage_data_off = dataOff;
+    buf->stage_resp_off = respOff;
+    buf->stage_pa = (ULONGLONG)pa.QuadPart;
+    buf->stage_va = va;
+    return TRUE;
+}
+
+/* copyResp: the device completed the buffer, hand its response back to the caller's memory. */
+static void UnstageVbuf(PGPU_VBUFFER buf, BOOLEAN copyResp)
+{
+    if (buf == NULL || buf->stage_va == NULL)
+    {
+        return;
+    }
+    PUCHAR va = (PUCHAR)buf->stage_va;
+    if (copyResp && buf->resp_size > 0 && buf->resp_buf)
+    {
+        RtlCopyMemory(buf->resp_buf, va + buf->stage_resp_off, (ULONG)buf->resp_size);
+    }
+    buf->stage_va = NULL;
+    VioGpuRdmaStageFree(va, buf->stage_bytes);
+    buf->stage_bytes = 0;
+}
+
+/* Stage, waiting a little for staging room where the IRQL allows it. */
+static BOOLEAN StageVbufWait(PGPU_VBUFFER buf)
+{
+    if (StageVbuf(buf))
+    {
+        return TRUE;
+    }
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL)
+    {
+        LARGE_INTEGER delay;
+        delay.QuadPart = -10000LL; /* 1 ms */
+        for (UINT attempt = 0; attempt < 500; attempt++)
+        {
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            if (StageVbuf(buf))
+            {
+                return TRUE;
+            }
+        }
+    }
+    VioGpuRegLog("queue: no staging room for cmd %u (%d+%u+%d bytes)\n",
+                 buf->size >= (int)sizeof(GPU_CTRL_HDR) ? ((PGPU_CTRL_HDR)buf->buf)->type : 0,
+                 buf->size,
+                 buf->data_size,
+                 buf->resp_size);
     return FALSE;
 }
 
@@ -1376,6 +1476,33 @@ static BOOLEAN BuildVbufSGList(PGPU_VBUFFER buf, VirtIOBufferDescriptor sg[], UI
     UINT sgleft = SGLIST_SIZE;
     UINT outcnt = 0, incnt = 0;
 
+    if (buf->stage_va != NULL)
+    {
+        /* Protected VM: describe the staged copy, one descriptor per part (the staging run is
+         * physically contiguous). Deterministic in the vbuf's fields like the stock path. */
+        if (buf->size > 0)
+        {
+            sg[outcnt].physAddr.QuadPart = (LONGLONG)buf->stage_pa;
+            sg[outcnt].length = (ULONG)buf->size;
+            outcnt++;
+        }
+        if (buf->data_buf && buf->data_size)
+        {
+            sg[outcnt].physAddr.QuadPart = (LONGLONG)buf->stage_pa + buf->stage_data_off;
+            sg[outcnt].length = buf->data_size;
+            outcnt++;
+        }
+        if (buf->resp_size > 0 && buf->resp_buf)
+        {
+            sg[outcnt + incnt].physAddr.QuadPart = (LONGLONG)buf->stage_pa + buf->stage_resp_off;
+            sg[outcnt + incnt].length = (ULONG)buf->resp_size;
+            incnt++;
+        }
+        *poutcnt = outcnt;
+        *pincnt = incnt;
+        return (outcnt + incnt) != 0;
+    }
+
     if (buf->size > PAGE_SIZE)
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s size is too big %d\n", __FUNCTION__, buf->size));
@@ -1439,8 +1566,17 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
     UINT outcnt = 0, incnt = 0;
     KIRQL SavedIrql;
 
-    if (!BuildVbufSGList(buf, sg, &outcnt, &incnt))
+    // Protected VM: copy the command/data into shared memory first; the descriptors are built
+    // from that copy (here and again if the vbuf has to be parked and resubmitted).
+    BOOLEAN stagedOk = TRUE;
+    if (VioGpuRdmaActive())
     {
+        stagedOk = StageVbufWait(buf);
+    }
+
+    if (!stagedOk || !BuildVbufSGList(buf, sg, &outcnt, &incnt))
+    {
+        UnstageVbuf(buf, FALSE);
         // Don't leak the fence: fire the completion callback and release the
         // vbuf (mirroring the AddBuf-failure arm) so the owning command
         // advances and dxgkrnl sees the fence retire instead of timing the
@@ -1527,6 +1663,7 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("<--> %s AddBuf failed rc=%d; firing complete_cb\n",
                   __FUNCTION__, rc));
+        UnstageVbuf(buf, FALSE);
         if (buf->complete_cb &&
             InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
@@ -1587,6 +1724,9 @@ PGPU_VBUFFER CtrlQueue::DequeueBuffer(_Out_ UINT *len)
         SubmitPendingLocked();
     }
     Unlock(SavedIrql);
+    // Protected VM: the device answered into the staged copy; hand the response back before any
+    // caller (the completion callbacks run after this returns) reads it.
+    UnstageVbuf(buf, TRUE);
     if (buf == NULL)
     {
         *len = 0;
@@ -1621,6 +1761,7 @@ void CtrlQueue::Close(void)
     {
         PGPU_VBUFFER buf = CONTAINING_RECORD(RemoveHeadList(&parked), GPU_VBUFFER, pending_entry);
 
+        UnstageVbuf(buf, FALSE);
         if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
@@ -1697,6 +1838,7 @@ void VioGpuBuf::Close(void)
     {
         PLIST_ENTRY entry = RemoveHeadList(&drained);
         PGPU_VBUFFER pvbuf = CONTAINING_RECORD(entry, GPU_VBUFFER, list_entry);
+        UnstageVbuf(pvbuf, FALSE);
 
         if (pvbuf->complete_cb &&
             InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
@@ -1912,6 +2054,9 @@ void VioGpuBuf::FreeBuf(_In_ PGPU_VBUFFER pbuf)
         return;
     }
 
+    // Protected VM: whatever path released the vbuf, its staging run goes back.
+    UnstageVbuf(pbuf, FALSE);
+
     if (pbuf->resp_buf && pbuf->resp_size > MAX_INLINE_RESP_SIZE)
     {
         delete[] reinterpret_cast<PBYTE>(pbuf->resp_buf);
@@ -1978,6 +2123,8 @@ VioGpuMemSegment::VioGpuMemSegment(void)
     m_pMdl = NULL;
     m_bSystemMemory = FALSE;
     m_bMapped = FALSE;
+    m_bRdma = FALSE;
+    m_RdmaPa.QuadPart = 0;
     m_Size = 0;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
@@ -2007,6 +2154,35 @@ BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr
 
     DbgPrint(TRACE_LEVEL_WARNING,
              ("%s mapping 0x%llx - %u\n", __FUNCTION__, pPAddr ? pPAddr->QuadPart : 0LL, size));
+
+    if (VioGpuRdmaOpen())
+    {
+        /* Protected VM: the whole segment is one contiguous shared-pool region, attached to the
+         * device as a single backing entry. No MDL: the pool is an I/O-space mapping. */
+        m_pVAddr = VioGpuRdmaRegionAlloc(size, &m_RdmaPa);
+        if (!m_pVAddr)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("rdma: no pool region for %u bytes\n", size));
+            return FALSE;
+        }
+        m_bRdma = TRUE;
+        m_bSystemMemory = TRUE;
+        m_pSGList = reinterpret_cast<PSCATTER_GATHER_LIST>(new (NonPagedPoolNx) BYTE[sglsize]);
+        if (!m_pSGList)
+        {
+            VioGpuRdmaRegionFree(m_pVAddr);
+            m_pVAddr = NULL;
+            m_bRdma = FALSE;
+            m_bSystemMemory = FALSE;
+            return FALSE;
+        }
+        RtlZeroMemory(m_pSGList, sglsize);
+        m_pSGList->NumberOfElements = 1;
+        m_pSGList->Elements[0].Address = m_RdmaPa;
+        m_pSGList->Elements[0].Length = size;
+        m_Size = size;
+        return TRUE;
+    }
 
     if ((pPAddr == NULL) || pPAddr->QuadPart == 0LL)
     {
@@ -2101,6 +2277,10 @@ PHYSICAL_ADDRESS VioGpuMemSegment::GetPhysicalAddress(void)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     PHYSICAL_ADDRESS pa = {0};
+    if (m_bRdma)
+    {
+        return m_RdmaPa;
+    }
     if (m_pVAddr && MmIsAddressValid(m_pVAddr))
     {
         pa = MmGetPhysicalAddress(m_pVAddr);
@@ -2116,6 +2296,18 @@ void VioGpuMemSegment::Close(void)
     PAGED_CODE();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    if (m_bRdma)
+    {
+        VioGpuRdmaRegionFree(m_pVAddr);
+        m_pVAddr = NULL;
+        m_bRdma = FALSE;
+        m_bSystemMemory = FALSE;
+        delete[] reinterpret_cast<PBYTE>(m_pSGList);
+        m_pSGList = NULL;
+        m_Size = 0;
+        return;
+    }
 
     if (m_pMdl)
     {
@@ -2225,7 +2417,20 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
     UINT ret = 0;
 
     ASSERT(buf->size <= PAGE_SIZE);
-    if (BuildSGElement(&sg[outcnt], (PVOID)buf->buf, buf->size))
+    if (VioGpuRdmaActive())
+    {
+        // Protected VM: the cursor update goes through shared memory too (no response).
+        if (!StageVbuf(buf))
+        {
+            VioGpuRegLog("queue: cursor command dropped, no staging room\n");
+            ReleaseBuffer(buf);
+            return res;
+        }
+        sg[outcnt].physAddr.QuadPart = (LONGLONG)buf->stage_pa;
+        sg[outcnt].length = (ULONG)buf->size;
+        outcnt++;
+    }
+    else if (BuildSGElement(&sg[outcnt], (PVOID)buf->buf, buf->size))
     {
         outcnt++;
     }
@@ -2235,6 +2440,10 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
     ret = AddBuf(&sg[0], outcnt, 0, buf, NULL, 0);
     Kick();
     Unlock(SavedIrql);
+    if ((int)ret < 0)
+    {
+        UnstageVbuf(buf, FALSE);
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p outcnt = %d, ret = %d\n", __FUNCTION__, buf, outcnt, ret));
     return res;
@@ -2249,6 +2458,7 @@ PGPU_VBUFFER CrsrQueue::DequeueCursor(_Out_ UINT *len)
     Lock(&SavedIrql);
     buf = (PGPU_VBUFFER)GetBuf(len);
     Unlock(SavedIrql);
+    UnstageVbuf(buf, TRUE);
     if (buf == NULL)
     {
         *len = 0;

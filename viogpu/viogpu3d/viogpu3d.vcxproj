@@ -272,7 +272,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -290,7 +290,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -308,7 +308,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -321,7 +321,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -342,7 +342,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -356,7 +356,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -373,7 +373,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -386,7 +386,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win10 Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -403,7 +403,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -416,7 +416,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>..\viogpu3d\trace.h</WppScanConfigurationData>
@@ -430,7 +430,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Win11 Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -447,7 +447,7 @@
       <AdditionalLibraryDirectories>..\..\VirtIO\$(OutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(SDK_INC_PATH);..\common;..\shared;..\..\VirtIO;..\viogpu3d\;..\..\rdmapool;</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WppEnabled>true</WppEnabled>
       <WppScanConfigurationData>trace.h</WppScanConfigurationData>
@@ -461,6 +461,7 @@
     <ClInclude Include="..\common\helper.h" />
     <ClInclude Include="..\common\viogpu_pnp_fixup.h" />
     <ClInclude Include="..\common\viogpu_queue.h" />
+    <ClInclude Include="..\common\viogpu_rdma.h" />
     <ClInclude Include="..\common\virgl_hw.h" />
     <ClInclude Include="driver.h" />
     <ClInclude Include="viogpu_command.h" />
@@ -477,6 +478,8 @@
     <ClCompile Include="..\common\viogpu_pci.cpp" />
     <ClCompile Include="..\common\viogpu_pnp_fixup.cpp" />
     <ClCompile Include="..\common\viogpu_queue.cpp" />
+    <ClCompile Include="..\common\viogpu_rdma.cpp" />
+    <ClCompile Include="..\..\rdmapool\rdmaclient.c"><WppEnabled>false</WppEnabled></ClCompile>
     <ClCompile Include="driver.cpp" />
     <ClCompile Include="viogpu_command.cpp" />
     <ClCompile Include="viogpu_device.cpp" />
