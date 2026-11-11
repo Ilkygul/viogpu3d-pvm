@@ -32,7 +32,7 @@
     extern "C" void VioGpuRegLog(const char *fmt, ...);
     __forceinline bool VioGpuRegLogOn(int level)
     {
-        return level <= TRACE_LEVEL_ERROR;
+        return level <= TRACE_LEVEL_VERBOSE; // test: everything (bring-up)
     }
 #define DbgPrint(Level, MSG) \
     { \

@@ -3932,10 +3932,111 @@ static ULONGLONG ReadQwordParameter(PCWSTR name, ULONGLONG defaultValue)
     return value;
 }
 
-#define VIOGPU_DEFAULT_GPU_GUEST_BASE   0x168000000ull
-#define VIOGPU_DEFAULT_GPU_GUEST_SIZE   (512ull << 20)
-#define VIOGPU_DEFAULT_VENUS_HOST_BASE  0x188000000ull
-#define VIOGPU_DEFAULT_VENUS_HOST_SIZE  (128ull << 20)
+// The pools are ACPI devices (DroidVM's edk2 turns the DT pool nodes into ACPI\DRVM0001, instance
+// GPU_GUEST / VENUS_HOST) that no driver binds; where they sit moves with the VM's memory size. Find
+// their PDOs under \Driver\ACPI and read the memory range from the translated boot configuration.
+extern "C" NTKERNELAPI NTSTATUS ObReferenceObjectByName(PUNICODE_STRING ObjectName, ULONG Attributes, PACCESS_STATE AccessState,
+                                                        ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType,
+                                                        KPROCESSOR_MODE AccessMode, PVOID ParseContext, PVOID *Object);
+extern "C" POBJECT_TYPE *IoDriverObjectType;
+extern "C" NTKERNELAPI NTSTATUS IoEnumerateDeviceObjectList(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT *DeviceObjectList,
+                                                            ULONG DeviceObjectListSize, PULONG ActualNumberDeviceObjects);
+static const DEVPROPKEY kDevpkeyInstanceId = {{0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256};
+
+static BOOLEAN DrvmRangeOverlapsRam(ULONGLONG base, ULONGLONG size)
+{
+    PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
+    BOOLEAN overlap = FALSE;
+    if (ranges == NULL)
+    {
+        return TRUE; /* cannot prove it is not RAM: refuse */
+    }
+    for (PPHYSICAL_MEMORY_RANGE r = ranges; r->BaseAddress.QuadPart != 0 || r->NumberOfBytes.QuadPart != 0; r++)
+    {
+        ULONGLONG rb = (ULONGLONG)r->BaseAddress.QuadPart, re = rb + (ULONGLONG)r->NumberOfBytes.QuadPart;
+        if (base < re && base + size > rb)
+        {
+            overlap = TRUE;
+            break;
+        }
+    }
+    ExFreePool(ranges);
+    return overlap;
+}
+
+#pragma warning(push)
+#pragma warning(disable : 4996) // ExAllocatePoolWithTag: the driver targets Windows 10 RTM headers
+static VOID FindDrvmPools(ULONGLONG *guestBase, ULONGLONG *guestSize, ULONGLONG *venusBase, ULONGLONG *venusSize)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING(L"\\Driver\\ACPI");
+    PDRIVER_OBJECT acpi = NULL;
+    NTSTATUS st = ObReferenceObjectByName(&name, OBJ_CASE_INSENSITIVE, NULL, 0, *IoDriverObjectType, KernelMode, NULL, (PVOID *)&acpi);
+    if (!NT_SUCCESS(st))
+    {
+        VioGpuRegLog("pool: \\Driver\\ACPI not found (0x%x)\n", st);
+        return;
+    }
+    ULONG count = 0;
+    IoEnumerateDeviceObjectList(acpi, NULL, 0, &count);
+    PDEVICE_OBJECT *devs = count ? (PDEVICE_OBJECT *)ExAllocatePoolWithTag(PagedPool, count * sizeof(PDEVICE_OBJECT), 'pGoV') : NULL;
+    if (devs == NULL || !NT_SUCCESS(IoEnumerateDeviceObjectList(acpi, devs, count * sizeof(PDEVICE_OBJECT), &count)))
+    {
+        VioGpuRegLog("pool: cannot list ACPI devices (%u)\n", count);
+        if (devs) ExFreePoolWithTag(devs, 'pGoV');
+        ObDereferenceObject(acpi);
+        return;
+    }
+    WCHAR buf[256];
+    for (ULONG i = 0; i < count; i++)
+    {
+        ULONG len = 0;
+        RtlZeroMemory(buf, sizeof(buf));
+        if (NT_SUCCESS(IoGetDeviceProperty(devs[i], DevicePropertyHardwareID, sizeof(buf) - sizeof(WCHAR), buf, &len)) &&
+            wcsstr(buf, L"DRVM0001") != NULL)
+        {
+            WCHAR inst[128] = {0};
+            DEVPROPTYPE type = 0;
+            ULONG req = 0;
+            IoGetDevicePropertyData(devs[i], &kDevpkeyInstanceId, LOCALE_NEUTRAL, 0, sizeof(inst) - sizeof(WCHAR), inst, &req, &type);
+            UCHAR cfg[512];
+            if (NT_SUCCESS(IoGetDeviceProperty(devs[i], DevicePropertyBootConfigurationTranslated, sizeof(cfg), cfg, &len)) && len >= sizeof(CM_RESOURCE_LIST))
+            {
+                PCM_RESOURCE_LIST list = (PCM_RESOURCE_LIST)cfg;
+                PCM_PARTIAL_RESOURCE_LIST pl = &list->List[0].PartialResourceList;
+                for (ULONG k = 0; k < pl->Count; k++)
+                {
+                    PCM_PARTIAL_RESOURCE_DESCRIPTOR d = &pl->PartialDescriptors[k];
+                    if (d->Type != CmResourceTypeMemory && d->Type != CmResourceTypeMemoryLarge)
+                    {
+                        continue;
+                    }
+                    ULONGLONG b = (ULONGLONG)d->u.Memory.Start.QuadPart, z = RtlCmDecodeMemIoResource(d, NULL);
+                    VioGpuRegLog("pool: found %ws at %I64x+%I64x\n", inst, b, z);
+                    if (wcsstr(inst, L"GPU_GUEST") != NULL)
+                    {
+                        *guestBase = b;
+                        *guestSize = z;
+                    }
+                    else if (wcsstr(inst, L"VENUS_HOST") != NULL)
+                    {
+                        *venusBase = b;
+                        *venusSize = z;
+                    }
+                    break;
+                }
+            }
+            else
+            {
+                VioGpuRegLog("pool: %ws has no boot configuration\n", inst);
+            }
+        }
+        ObDereferenceObject(devs[i]);
+    }
+    ExFreePoolWithTag(devs, 'pGoV');
+    ObDereferenceObject(acpi);
+}
+#pragma warning(pop)
+
 #define VIOGPU_DEFAULT_VIDMM_BYTES      (256ull << 20)
 
 VOID VioGpuAdapter::PoolsInit(VOID)
@@ -3951,10 +4052,22 @@ VOID VioGpuAdapter::PoolsInit(VOID)
         VioGpuRegLog("pool: no rdmapool, not a protected VM: stock memory model\n");
         return;
     }
-    m_GuestPoolBase = ReadQwordParameter(L"GpuGuestPoolBase", VIOGPU_DEFAULT_GPU_GUEST_BASE);
-    m_GuestPoolSize = ReadQwordParameter(L"GpuGuestPoolSize", VIOGPU_DEFAULT_GPU_GUEST_SIZE);
-    m_VenusPoolBase = ReadQwordParameter(L"VenusHostPoolBase", VIOGPU_DEFAULT_VENUS_HOST_BASE);
-    m_VenusPoolSize = ReadQwordParameter(L"VenusHostPoolSize", VIOGPU_DEFAULT_VENUS_HOST_SIZE);
+    // Where the pools are: the ACPI devices first, registry values override (no fixed defaults: the
+    // layout moves with the VM's memory size, and mapping a stale address would be guest RAM).
+    ULONGLONG gb = 0, gz = 0, vb = 0, vz = 0;
+    FindDrvmPools(&gb, &gz, &vb, &vz);
+    m_GuestPoolBase = ReadQwordParameter(L"GpuGuestPoolBase", gb);
+    m_GuestPoolSize = ReadQwordParameter(L"GpuGuestPoolSize", gz);
+    m_VenusPoolBase = ReadQwordParameter(L"VenusHostPoolBase", vb);
+    m_VenusPoolSize = ReadQwordParameter(L"VenusHostPoolSize", vz);
+    if ((m_GuestPoolSize && DrvmRangeOverlapsRam(m_GuestPoolBase, m_GuestPoolSize)) ||
+        (m_VenusPoolSize && DrvmRangeOverlapsRam(m_VenusPoolBase, m_VenusPoolSize)))
+    {
+        VioGpuRegLog("pool: a pool range overlaps guest RAM (GPU_GUEST %I64x+%I64x VENUS_HOST %I64x+%I64x): not used\n",
+                     m_GuestPoolBase, m_GuestPoolSize, m_VenusPoolBase, m_VenusPoolSize);
+        m_GuestPoolSize = 0;
+        m_VenusPoolSize = 0;
+    }
     ULONGLONG vidmm = ReadQwordParameter(L"GpuGuestVidmmBytes", VIOGPU_DEFAULT_VIDMM_BYTES);
     m_PoolKeepAperture = ReadQwordParameter(L"PoolKeepAperture", 0) != 0;
 
