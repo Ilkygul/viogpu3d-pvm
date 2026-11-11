@@ -60,6 +60,24 @@ VioGpuAllocation::VioGpuAllocation(VioGpuAdapter *adapter, VIOGPU_RESOURCE_BLOB_
     m_IsPrimary = FALSE;
     m_IsShared = FALSE;
     memcpy(&m_Blob.Options, options, sizeof(*options));
+    // Protected VM: a guest-vram blob is placed in the GPU_GUEST pool and mapped by the KMD, so it is
+    // always mappable.  Without the pools the flag is ignored and the blob stays a plain HOST3D blob.
+    m_GuestVram = FALSE;
+    if (options->blob_flags & VIOGPU_BLOB_FLAG_GUEST_VRAM)
+    {
+        if (m_adapter->PoolMode() && options->blob_mem == VIOGPU_BLOB_MEM_HOST3D && !residencyOnly)
+        {
+            m_GuestVram = TRUE;
+            m_Blob.Options.blob_flags |= VIOGPU_BLOB_FLAG_USE_MAPPABLE;
+        }
+        else
+        {
+            m_Blob.Options.blob_flags &= ~VIOGPU_BLOB_FLAG_GUEST_VRAM;
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s GUEST_VRAM blob requested without pools (mem=%u) -- plain blob\n",
+                      __FUNCTION__, options->blob_mem));
+        }
+    }
     RtlZeroMemory(&m_Blob.Info, sizeof(m_Blob.Info));
     // TODO: find a way to make valid
     // Probably via escape or something
@@ -637,9 +655,34 @@ void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATE
         // physical page number.  A Zero entry resolves to the zero page and a
         // LargePage covers more than one page -- neither names a byte of
         // backing this driver may hand to the host.
-        if (p->Valid && !p->Zero && !p->LargePage && p->Segment == 0)
+        // Protected VM: system-memory pages (segment 0) are private to the guest and invisible to the
+        // host; the shared-pool pages are VidMm's segment 1, addressed by segment offset.
+        ULONGLONG poolAddr = 0;
+        BOOLEAN usable = FALSE;
+        if (p->Valid && !p->Zero && !p->LargePage)
         {
-            const ULONGLONG addr = (ULONGLONG)p->PageAddress << PAGE_SHIFT;
+            if (m_adapter->PoolMode())
+            {
+                if (p->Segment != 0)
+                {
+                    poolAddr = m_adapter->PoolPaFromSegment(p->Segment, (ULONGLONG)p->PageAddress << PAGE_SHIFT);
+                    usable = (poolAddr != 0);
+                }
+                else if (!m_PrivatePagesLogged)
+                {
+                    m_PrivatePagesLogged = TRUE;
+                    VioGpuRegLog("backing: res_id=%u got PRIVATE system pages (segment 0): the host cannot read this "
+                                 "allocation; not attached\n", m_Id);
+                }
+            }
+            else
+            {
+                usable = (p->Segment == 0);
+            }
+        }
+        if (usable)
+        {
+            const ULONGLONG addr = m_adapter->PoolMode() ? poolAddr : ((ULONGLONG)p->PageAddress << PAGE_SHIFT);
             if (m_GpummuPages[page] == GPUMMU_PAGE_UNFILLED)
             {
                 m_GpummuFilled++;
@@ -684,13 +727,22 @@ void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATE
                      ("%s res_id=%d cannot allocate %zu backing entries\n", __FUNCTION__, m_Id, total));
             return;
         }
+        // Physically adjacent pages (always, for the shared pool) share one entry.
+        size_t nents = 0;
         for (size_t i = 0; i < total; i++)
         {
-            ents[i].addr = m_GpummuPages[i];
-            ents[i].length = PAGE_SIZE;
-            ents[i].padding = 0;
+            if (nents > 0 && ents[nents - 1].addr + ents[nents - 1].length == m_GpummuPages[i] &&
+                (ULONGLONG)ents[nents - 1].length + PAGE_SIZE < 0x80000000ull)
+            {
+                ents[nents - 1].length += PAGE_SIZE;
+                continue;
+            }
+            ents[nents].addr = m_GpummuPages[i];
+            ents[nents].length = PAGE_SIZE;
+            ents[nents].padding = 0;
+            nents++;
         }
-        m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)total);
+        m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)nents);
         m_BackingAttached = TRUE;
         DbgPrint(TRACE_LEVEL_VERBOSE, ("%s attach res_id=%d pages=%zu\n", __FUNCTION__, m_Id, total));
     }
@@ -704,14 +756,66 @@ VOID VioGpuAllocation::CreateBlob(UINT ctx_id)
 
     if (IsCreated()) return;
 
-    bool ok = m_adapter->ctrlQueue.CreateResourceBlob(m_Id, ctx_id, &m_Blob.Options, m_Size);
+    IssueCreateBlobLocked(ctx_id);
+}
+
+BOOLEAN VioGpuAllocation::PlaceGuestVramLocked()
+{
+    if (m_KmdShmem.Placed)
+    {
+        return TRUE;
+    }
+    ULONGLONG off = m_adapter->ShmemAlloc((SIZE_T)m_Size);
+    if (off == (ULONGLONG)-1)
+    {
+        return FALSE;
+    }
+    // Place before setting the latch: SetSegmentPlacement refuses to move a KMD-owned offset once
+    // Placed is set.
+    SetSegmentPlacement(2, off, "kmd-guest-vram");
+    m_KmdShmem.Placed = TRUE;
+    m_KmdShmem.MapSize = (SIZE_T)m_Size;
+    return TRUE;
+}
+
+BOOLEAN VioGpuAllocation::IssueCreateBlobLocked(UINT ctx_id)
+{
+    ULONGLONG guestPa = 0;
+    if (m_GuestVram)
+    {
+        if (!PlaceGuestVramLocked())
+        {
+            VioGpuRegLog("guestvram: res_id=%u no room for %I64u bytes in the GPU_GUEST window\n", m_Id, m_Size);
+            m_Blob.Created = FALSE;
+            return FALSE;
+        }
+        guestPa = m_adapter->GetShmemPA() + m_Blob.MapOffset;
+    }
+    bool ok = m_adapter->ctrlQueue.CreateResourceBlob(m_Id, ctx_id, &m_Blob.Options, m_Size, guestPa);
     m_Blob.Created = ok;
+    VioGpuRegLog("blob: create res_id=%u mem=%u flags=0x%x blob_id=%I64u size=%I64u guestPa=%I64x -> %s\n",
+                 m_Id,
+                 m_Blob.Options.blob_mem,
+                 m_Blob.Options.blob_flags,
+                 m_Blob.Options.blob_id,
+                 m_Size,
+                 guestPa,
+                 ok ? "ok" : "FAILED");
+    return ok ? TRUE : FALSE;
 }
 
 BOOLEAN VioGpuAllocation::MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
 {
     if (m_Id == 0)
     {
+        return FALSE;
+    }
+    if (m_adapter->PoolMode())
+    {
+        // Protected VM: a guest-vram blob lives in the GPU_GUEST pool and needs no host mapping; a
+        // HOST3D blob's window comes from the host's MAP_BLOB answer, which only the RES_INFO escape
+        // (MapBlobSyncLocked) reads.  The packet path has nothing to do: report "already in state"
+        // (no host command, no callback).
         return FALSE;
     }
     if (!m_adapter->ctrlQueue.ResourceMapBlob(m_Id, ctx_id, m_Blob.MapOffset, complete_cb, complete_ctx))
@@ -740,6 +844,38 @@ BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
     if (pEntry != nullptr)
     {
         ctxId = pEntry->value.GetCtxId();
+    }
+    if (m_GuestVram)
+    {
+        return TRUE; // the pages are ours; nothing to map host-side
+    }
+    if (m_adapter->PoolMode())
+    {
+        // Protected VM: the host sub-allocates the blob from the pre-shared VENUS_HOST pool and
+        // answers with the pool byte offset.  A BAR window is useless here.
+        ULONG mapInfo = 0, poolOffset = 0;
+        if (!m_adapter->ctrlQueue.ResourceMapBlobSync(m_Id, ctxId, 0, &mapInfo, &poolOffset))
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d pool map failed\n", __FUNCTION__, m_Id));
+            return FALSE;
+        }
+        if (!(mapInfo & VIRTIO_GPU_MAP_INFO_POOL) ||
+            (ULONGLONG)poolOffset + m_Size > m_adapter->VenusPoolSize() || !m_adapter->HasVenusPool())
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s res_id=%d host answered map_info=0x%x offset=0x%x: not a usable venus-pool window\n",
+                      __FUNCTION__, m_Id, mapInfo, poolOffset));
+            VioGpuRegLog("venuspool: res_id=%u map_info=0x%x pool_offset=0x%x size=%I64u -> UNUSABLE\n",
+                         m_Id, mapInfo, poolOffset, m_Size);
+            // leave it mapped host-side; it is torn down with the resource
+            m_Blob.Mapped = TRUE;
+            return FALSE;
+        }
+        m_PoolPa = m_adapter->VenusPoolBase() + poolOffset;
+        m_Blob.Mapped = TRUE;
+        VioGpuRegLog("venuspool: res_id=%u map_info=0x%x pool_offset=0x%x -> pa %I64x size=%I64u\n",
+                     m_Id, mapInfo, poolOffset, m_PoolPa, m_Size);
+        return TRUE;
     }
     if (!m_adapter->ctrlQueue.ResourceMapBlobSync(m_Id, ctxId, m_Blob.MapOffset))
     {
@@ -1146,8 +1282,10 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                                            allocationInfo->Size,
                                            resourceExchange->Options3D.width,
                                            resourceExchange->Options3D.height));
-            allocationInfo->EvictionSegmentSet = 1; // don't use apperture for eviction
-            allocationInfo->PreferredSegment.SegmentId0 = 1;
+            // Protected VM: segment 1 is the shared-pool local segment, not an aperture; there is no
+            // eviction target (evicting to private system memory would hide the pages from the host).
+            allocationInfo->EvictionSegmentSet = adapter->PoolMode() ? 0 : 1; // don't use apperture for eviction
+            allocationInfo->PreferredSegment.SegmentId0 = adapter->PoolMode() ? adapter->PoolVidmmSegId() : 1;
             allocationInfo->PreferredSegment.Direction0 = 0;
             allocationInfo->Flags.CpuVisible = TRUE;
             // Coherent 3D resources (the win32k staging and shadow surfaces
@@ -1168,8 +1306,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             {
                 allocationInfo->Flags.Cached = TRUE;
             }
-            allocationInfo->SupportedReadSegmentSet = 0b1;
-            allocationInfo->SupportedWriteSegmentSet = 0b1;
+            allocationInfo->SupportedReadSegmentSet = adapter->PoolMode() ? (1u << (adapter->PoolVidmmSegId() - 1)) : 0b1;
+            allocationInfo->SupportedWriteSegmentSet = allocationInfo->SupportedReadSegmentSet;
             break;
         case VIOGPU_RESOURCE_TYPE_BLOB:
             DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s blob res_id=%d size=%d\n",
@@ -1236,8 +1374,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                                            resourceExchange->OptionsShared.width,
                                            resourceExchange->OptionsShared.height,
                                            resourceExchange->OptionsShared.primary));
-            allocationInfo->EvictionSegmentSet = 1;
-            allocationInfo->PreferredSegment.SegmentId0 = 1;
+            allocationInfo->EvictionSegmentSet = adapter->PoolMode() ? 0 : 1;
+            allocationInfo->PreferredSegment.SegmentId0 = adapter->PoolMode() ? adapter->PoolVidmmSegId() : 1;
             allocationInfo->PreferredSegment.Direction0 = 0;
             allocationInfo->Flags.CpuVisible = TRUE;
             // Non-primary shared surfaces are the composited window surfaces
@@ -1249,8 +1387,8 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             {
                 allocationInfo->Flags.Cached = TRUE;
             }
-            allocationInfo->SupportedReadSegmentSet = 0b1;
-            allocationInfo->SupportedWriteSegmentSet = 0b1;
+            allocationInfo->SupportedReadSegmentSet = adapter->PoolMode() ? (1u << (adapter->PoolVidmmSegId() - 1)) : 0b1;
+            allocationInfo->SupportedWriteSegmentSet = allocationInfo->SupportedReadSegmentSet;
             if (resourceExchange->OptionsShared.primary)
             {
                 // Promote to the active scanout source as soon as the runtime
@@ -1424,6 +1562,86 @@ NTSTATUS VioGpuAllocation::UnmapApertureSegment(DXGKARG_BUILDPAGINGBUFFER *pBuil
     return STATUS_SUCCESS;
 }
 
+// Map the physical window [pa, pa + size) into the calling process, once per process.  The window
+// is a BAR range (normally) or shared-pool memory (protected VM).  Allocation lock held.
+PVOID VioGpuAllocation::MapWindowForCurrentProcessLocked(ULONGLONG pa, SIZE_T size)
+{
+    // One mapping per calling process: a shared blob is RES_INFO'd both by
+    // its creator and by cross-process openers, and each needs the window
+    // in its own address space.  A single-owner slot would starve whichever
+    // process came second into the D3DKMTLock fallback, which under GpuMmu
+    // hands out staging pages and corrupts data silently.
+    PEPROCESS self = PsGetCurrentProcess();
+    for (KmdShmemMapping *m = m_KmdShmem.Maps; m != NULL; m = m->Next)
+    {
+        if (m->Process == self)
+        {
+            return m->UserVa;
+        }
+    }
+    PVOID userVa = NULL;
+    // Build the MDL over the physical range directly:
+    // MmBuildMdlForNonPagedPool is only reliable for real nonpaged
+    // pool and yields wrong PFNs past the first few pages of an
+    // MmMapIoSpaceEx range.
+    PMDL mdl = IoAllocateMdl((PVOID)(ULONG_PTR)pa, (ULONG)size, FALSE, FALSE, NULL);
+    if (mdl != NULL)
+    {
+        PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
+        ULONG pages = (ULONG)ADDRESS_AND_SIZE_TO_SPAN_PAGES(pa, size);
+        for (ULONG i = 0; i < pages; i++)
+        {
+            pfns[i] = (PFN_NUMBER)((pa >> PAGE_SHIFT) + i);
+        }
+        mdl->MdlFlags |= MDL_PAGES_LOCKED;
+        __try
+        {
+            // CACHED (WB), matching the host: the render server
+            // maps these memfd pages write-back and virglrenderer
+            // reports MAP_CACHE_CACHED for them.  Under
+            // honor-guest-pat=on a WC guest mapping of host-WB
+            // pages is the SDM-undefined WB/WC alias and produces
+            // stale reads; the Linux guest maps these blobs WB
+            // for the same reason.
+            userVa = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE, NormalPagePriority);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d user map raised 0x%x\n", __FUNCTION__, m_Id, GetExceptionCode()));
+        }
+        KmdShmemMapping *node = NULL;
+        if (userVa != NULL)
+        {
+            node = (KmdShmemMapping *)ExAllocatePoolZero(NonPagedPoolNx, sizeof(KmdShmemMapping), VIOGPUTAG);
+        }
+        if (node != NULL)
+        {
+            // Reference the process: entries are pointer-
+            // compared, and an unreferenced EPROCESS could be
+            // reused by a new process after the owner dies.
+            ObReferenceObject(self);
+            node->Process = self;
+            node->Mdl = mdl;
+            node->UserVa = userVa;
+            node->Next = m_KmdShmem.Maps;
+            m_KmdShmem.Maps = node;
+        }
+        else
+        {
+            if (userVa != NULL)
+            {
+                MmUnmapLockedPages(userVa, mdl);
+                userVa = NULL;
+            }
+            IoFreeMdl(mdl);
+        }
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE,
+             ("%s res_id=%d user window pa=0x%llx size=%zu uva=%p proc=%p\n", __FUNCTION__, m_Id, pa, size, userVa, self));
+    VioGpuRegLog("window: res_id=%u pa=%I64x size=%Iu -> uva=%p\n", m_Id, pa, size, userVa);
+    return userVa;
+}
+
 NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioGpuDevice *pMapDevice)
 {
     PAGED_CODE();
@@ -1437,103 +1655,64 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
     // the calling process, and return the VA -- the UMD uses it instead
     // of D3DKMTLock.  The escape runs in-process, so the user mapping
     // lands in the right address space.
+    //
+    // Protected VM: guest-vram blobs are placed in the GPU_GUEST pool at creation; other mappable
+    // (HOST3D) blobs are placed by the host in the VENUS_HOST pool when it answers MAP_BLOB.
     if (m_IsBlob && IsMappable())
     {
-        if (!m_KmdShmem.Placed)
+        const BOOLEAN poolHost = m_adapter->PoolMode() && !m_GuestVram;
+        ULONGLONG winPa = 0;
+        SIZE_T winSize = (SIZE_T)m_Size;
+        PVOID userVa = NULL;
+
+        if (poolHost)
         {
-            ULONGLONG off = m_adapter->ShmemAlloc((SIZE_T)m_Size);
-            if (off != (ULONGLONG)-1)
+            // Needs the host's answer first (the window's address is the answer).
+            if (!m_Blob.Mapped && pMapDevice != NULL && !MapBlobSyncLocked(pMapDevice))
             {
-                // Place before setting the latch: SetSegmentPlacement refuses
-                // to move a KMD-owned offset once Placed is set.
-                SetSegmentPlacement(2, off, "kmd-owned");
-                m_KmdShmem.Placed = TRUE;
-                m_KmdShmem.MapSize = (SIZE_T)m_Size;
+                DbgPrint(TRACE_LEVEL_ERROR,
+                         ("%s res_id=%d host pool map failed -- failing RES_INFO\n", __FUNCTION__, m_Id));
+                return STATUS_DEVICE_NOT_READY;
+            }
+            winPa = m_PoolPa;
+            if (winPa == 0 && pMapDevice == NULL)
+            {
+                // A caller that must not establish a mapping (blt-present descriptor read).
+                resInfo->UserVa = 0;
+                goto fill;
             }
         }
-        // One mapping per calling process: a shared blob is RES_INFO'd both by
-        // its creator and by cross-process openers, and each needs the window
-        // in its own address space.  A single-owner slot would starve whichever
-        // process came second into the D3DKMTLock fallback, which under GpuMmu
-        // hands out staging pages and corrupts data silently.
-        PVOID userVa = NULL;
-        if (m_KmdShmem.Placed)
+        else
         {
-            PEPROCESS self = PsGetCurrentProcess();
-            for (KmdShmemMapping *m = m_KmdShmem.Maps; m != NULL; m = m->Next)
+            if (!m_KmdShmem.Placed)
             {
-                if (m->Process == self)
+                if (m_GuestVram)
                 {
-                    userVa = m->UserVa;
-                    break;
+                    PlaceGuestVramLocked();
+                }
+                else
+                {
+                    ULONGLONG off = m_adapter->ShmemAlloc((SIZE_T)m_Size);
+                    if (off != (ULONGLONG)-1)
+                    {
+                        // Place before setting the latch: SetSegmentPlacement refuses
+                        // to move a KMD-owned offset once Placed is set.
+                        SetSegmentPlacement(2, off, "kmd-owned");
+                        m_KmdShmem.Placed = TRUE;
+                        m_KmdShmem.MapSize = (SIZE_T)m_Size;
+                    }
                 }
             }
-            if (userVa == NULL)
+            if (m_KmdShmem.Placed)
             {
-                // Build the MDL over the physical BAR range directly:
-                // MmBuildMdlForNonPagedPool is only reliable for real nonpaged
-                // pool and yields wrong PFNs past the first few pages of an
-                // MmMapIoSpaceEx range.
-                ULONGLONG pa = m_adapter->GetShmemPA() + m_Blob.MapOffset;
-                PMDL mdl = IoAllocateMdl((PVOID)(ULONG_PTR)pa, (ULONG)m_KmdShmem.MapSize, FALSE, FALSE, NULL);
-                if (mdl != NULL)
-                {
-                    PPFN_NUMBER pfns = MmGetMdlPfnArray(mdl);
-                    ULONG pages = (ULONG)ADDRESS_AND_SIZE_TO_SPAN_PAGES(pa, m_KmdShmem.MapSize);
-                    for (ULONG i = 0; i < pages; i++)
-                    {
-                        pfns[i] = (PFN_NUMBER)((pa >> PAGE_SHIFT) + i);
-                    }
-                    mdl->MdlFlags |= MDL_PAGES_LOCKED;
-                    __try
-                    {
-                        // CACHED (WB), matching the host: the render server
-                        // maps these memfd pages write-back and virglrenderer
-                        // reports MAP_CACHE_CACHED for them.  Under
-                        // honor-guest-pat=on a WC guest mapping of host-WB
-                        // pages is the SDM-undefined WB/WC alias and produces
-                        // stale reads; the Linux guest maps these blobs WB
-                        // for the same reason.
-                        userVa = MmMapLockedPagesSpecifyCache(mdl, UserMode, MmCached, NULL, FALSE,
-                                                              NormalPagePriority);
-                    }
-                    __except (EXCEPTION_EXECUTE_HANDLER)
-                    {
-                        DbgPrint(TRACE_LEVEL_ERROR,
-                                 ("%s res_id=%d user map raised 0x%x\n", __FUNCTION__, m_Id, GetExceptionCode()));
-                    }
-                    KmdShmemMapping *node = NULL;
-                    if (userVa != NULL)
-                    {
-                        node = (KmdShmemMapping *)ExAllocatePoolZero(NonPagedPoolNx, sizeof(KmdShmemMapping),
-                                                                     VIOGPUTAG);
-                    }
-                    if (node != NULL)
-                    {
-                        // Reference the process: entries are pointer-
-                        // compared, and an unreferenced EPROCESS could be
-                        // reused by a new process after the owner dies.
-                        ObReferenceObject(self);
-                        node->Process = self;
-                        node->Mdl = mdl;
-                        node->UserVa = userVa;
-                        node->Next = m_KmdShmem.Maps;
-                        m_KmdShmem.Maps = node;
-                    }
-                    else
-                    {
-                        if (userVa != NULL)
-                        {
-                            MmUnmapLockedPages(userVa, mdl);
-                            userVa = NULL;
-                        }
-                        IoFreeMdl(mdl);
-                    }
-                }
-                DbgPrint(TRACE_LEVEL_VERBOSE,
-                         ("%s res_id=%d kmd-owned shmem off=0x%llx size=%zu pa=0x%llx uva=%p proc=%p\n",
-                          __FUNCTION__, m_Id, m_Blob.MapOffset, m_KmdShmem.MapSize, pa, userVa, self));
+                winPa = m_adapter->GetShmemPA() + m_Blob.MapOffset;
+                winSize = m_KmdShmem.MapSize;
             }
+        }
+
+        if (winPa != 0)
+        {
+            userVa = MapWindowForCurrentProcessLocked(winPa, winSize);
         }
         if (userVa == NULL)
         {
@@ -1541,8 +1720,8 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
             // which under GpuMmu hands out staging pages -- reads and
             // writes silently land in the wrong memory.  Fail loudly.
             DbgPrint(TRACE_LEVEL_ERROR,
-                     ("%s res_id=%d no shmem mapping (placed=%d) -- failing RES_INFO\n",
-                      __FUNCTION__, m_Id, m_KmdShmem.Placed));
+                     ("%s res_id=%d no shmem mapping (placed=%d pool=%d) -- failing RES_INFO\n",
+                      __FUNCTION__, m_Id, m_KmdShmem.Placed, poolHost));
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         resInfo->UserVa = (ULONGLONG)(ULONG_PTR)userVa;
@@ -1557,7 +1736,7 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
         //
         // Only a created blob can be mapped; the UMD's RES_INFO retry loop
         // spins here until the create it issued has been queued.
-        if (pMapDevice != NULL && m_Blob.Created && !m_Blob.Mapped &&
+        if (!poolHost && !m_GuestVram && pMapDevice != NULL && m_Blob.Created && !m_Blob.Mapped &&
             !MapBlobSyncLocked(pMapDevice))
         {
             // The UMD would otherwise write into an unbacked BAR window.
@@ -1571,6 +1750,7 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
         resInfo->UserVa = 0;
     }
 
+fill:
     resInfo->Id = m_Id;
     resInfo->Size = m_Size;
     if (m_IsBlob)
@@ -1608,7 +1788,8 @@ NTSTATUS VioGpuAllocation::EscapeReleaseWindow(VioGpuDevice *pDevice)
     {
         return STATUS_INVALID_PARAMETER;
     }
-    if (!m_KmdShmem.Placed)
+    const BOOLEAN poolHost = m_adapter->PoolMode() && !m_GuestVram;
+    if (poolHost ? (m_PoolPa == 0 && m_KmdShmem.Maps == NULL) : !m_KmdShmem.Placed)
     {
         // Nothing to release; idempotent so the UMD's bookkeeping may
         // trail a racing destroy.
@@ -1648,6 +1829,13 @@ NTSTATUS VioGpuAllocation::EscapeReleaseWindow(VioGpuDevice *pDevice)
     }
     m_KmdShmem.Maps = NULL;
 
+    if (m_GuestVram)
+    {
+        // Protected VM guest-vram: the pages stay with the blob (the host's udmabuf references them);
+        // only the process mappings were released.  The next RES_INFO maps a fresh window.
+        return STATUS_SUCCESS;
+    }
+
     // The host must ACKNOWLEDGE the unmap before the window is recycled:
     // once ShmemFree hands the offset out, the next blob is mapped there,
     // and a still-live host mapping would alias it (the plain queued unmap
@@ -1671,6 +1859,13 @@ NTSTATUS VioGpuAllocation::EscapeReleaseWindow(VioGpuDevice *pDevice)
             return STATUS_UNSUCCESSFUL;
         }
         m_Blob.Mapped = FALSE;
+    }
+
+    if (poolHost)
+    {
+        // Protected VM: the window was the host's (VENUS_HOST pool); nothing of ours to recycle.
+        m_PoolPa = 0;
+        return STATUS_SUCCESS;
     }
 
     m_adapter->ShmemFree(m_Blob.MapOffset, m_KmdShmem.MapSize);

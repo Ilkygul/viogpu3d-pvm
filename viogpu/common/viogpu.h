@@ -387,6 +387,7 @@ typedef struct virtio_gpu_resp_resource_uuid {
 #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE     0x0001
 #define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE    0x0002
 #define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
+#define VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE 0x0008
 #pragma pack(1)
 typedef struct virtio_gpu_resource_create_blob {
     GPU_CTRL_HDR hdr;
@@ -500,11 +501,12 @@ typedef struct virtio_gpu_resource_map_blob {
 #define VIRTIO_GPU_MAP_CACHE_CACHED    0x01
 #define VIRTIO_GPU_MAP_CACHE_UNCACHED  0x02
 #define VIRTIO_GPU_MAP_CACHE_WC        0x03
+#define VIRTIO_GPU_MAP_INFO_POOL       0x80000000UL /* blob is resident in the pre-shared host pool */
 #pragma pack(1)
 typedef struct virtio_gpu_resp_map_info {
     GPU_CTRL_HDR hdr;
     ULONG map_info;
-    ULONG padding;
+    ULONG pool_offset; /* DroidVM crosvm: pool byte offset when map_info has VIRTIO_GPU_MAP_INFO_POOL */
 } GPU_RESP_MAP_INFO, *PGPU_RESP_MAP_INFO;
 #pragma pack()
 
@@ -558,6 +560,7 @@ typedef struct _COLOR_CHARACTERISTICS
 #define VIRTIO_GPU_F_RESOURCE_UUID 2
 #define VIRTIO_GPU_F_RESOURCE_BLOB 3
 #define VIRTIO_GPU_F_CONTEXT_INIT  4
+#define VIRTIO_GPU_F_CREATE_GUEST_HANDLE 6 /* DroidVM crosvm: blob mem entries become a guest-handle (udmabuf) */
 
 #define ISR_REASON_DISPLAY 1
 #define ISR_REASON_CURSOR  2

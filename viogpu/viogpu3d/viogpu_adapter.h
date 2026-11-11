@@ -94,11 +94,47 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN m_scanoutConnected[MAX_CHILDREN] = {FALSE};
 
     ULONGLONG GetShmemPA() {
+        if (m_PoolMode) {
+            // protected VM: the KMD-owned "shmem" window is the first part of the GPU_GUEST pool
+            return m_GuestPoolBase;
+        }
         if (!m_VioDev.shmem.available) {
             return 0;
         }
         return m_PciResources.GetPciBar(m_VioDev.shmem.bar)->GetPA().QuadPart + m_VioDev.shmem.offset;
     }
+
+    // ---- Gunyah protected VM (DroidVM) shared pools -------------------------------------------
+    // The host can only touch shared memory.  Besides the restricted DMA pool (viogpu_rdma.*) the
+    // VM has two fixed windows (ACPI\DRVM0001, no driver bound), whose bases/sizes come from
+    // HKLM\SYSTEM\CurrentControlSet\Services\VioGpu3D\Parameters (QWORD values; defaults below):
+    //   GPU_GUEST  GpuGuestPoolBase/Size   0x168000000 / 512 MB   guest VRAM: Venus device memory
+    //                                      and every host-readable 3D/GDI surface
+    //   VENUS_HOST VenusHostPoolBase/Size  0x188000000 / 128 MB   venus transport shmems; the host
+    //                                      places them and answers MAP_BLOB with a pool offset
+    //   GpuGuestVidmmBytes                 256 MB   slice of GPU_GUEST (its upper end) that VidMm
+    //                                      manages as segment 1; the rest is the KMD-owned window
+    //                                      (segment 2) that ShmemAlloc suballocates for blobs.
+    BOOLEAN PoolMode() const { return m_PoolMode; }
+    BOOLEAN HasVenusPool() const { return m_PoolMode && m_VenusPoolSize != 0; }
+    ULONGLONG VenusPoolBase() const { return m_VenusPoolBase; }
+    ULONGLONG VenusPoolSize() const { return m_VenusPoolSize; }
+    ULONGLONG ShmemWindowBytes() const { return m_PoolMode ? m_PoolKmdBytes : m_VioDev.shmem.length; }
+    // Segment-relative (or segment-global) VidMm segment address -> physical address in the
+    // GPU_GUEST pool; 0 when it does not name pool memory.
+    ULONGLONG PoolPaFromSegment(UINT segmentId, ULONGLONG addr) const;
+    // CPU mappings of the pool (paging operations).  NULL when the pool is not mapped or pa is
+    // outside it.
+    PUCHAR PoolVaFromPa(ULONGLONG pa, SIZE_T size) const;
+    NTSTATUS PoolFill(UINT segmentId, ULONGLONG addr, SIZE_T size, ULONG pattern);
+    NTSTATUS PoolCopy(UINT dstSeg, ULONGLONG dstAddr, UINT srcSeg, ULONGLONG srcAddr, SIZE_T size);
+    // PTE-style view of VidMm's segment 1: physical address of a segment page, 0 if out of range.
+    ULONGLONG PoolVidmmPa(ULONGLONG segOffset) const;
+
+    // VidMm's pool segment: id 1 (replaces the aperture) or, with the PoolKeepAperture QWORD
+    // parameter = 1, id 3 behind the unchanged (unused) aperture segment 1 and window segment 2.
+    UINT PoolVidmmSegId() const { return m_PoolKeepAperture ? 3 : 1; }
+    ULONGLONG PoolVidmmSegBase() const { return m_PoolKeepAperture ? 0x500000000ull : 0xC0000000ull; }
 
     static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
   private:
@@ -209,6 +245,9 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     VOID DpcRoutine(VOID);
     NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
     template <typename DESC> void FillShmemSegment(DESC *pDesc);
+    template <typename DESC> void FillPoolVidmmSegment(DESC *pDesc);
+    VOID PoolsInit(VOID);
+    VOID PoolsClose(VOID);
     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
@@ -290,6 +329,18 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     LIST_ENTRY m_PendingCreateList;
     LIST_ENTRY m_KmtMapList;
     LIST_ENTRY m_CookieMapList;
+
+    // Protected-VM pools (see PoolMode above); filled in by PoolsInit.
+    BOOLEAN m_PoolMode = FALSE;
+    BOOLEAN m_PoolsTried = FALSE;
+    BOOLEAN m_PoolKeepAperture = FALSE;
+    ULONGLONG m_GuestPoolBase = 0;
+    ULONGLONG m_GuestPoolSize = 0;
+    ULONGLONG m_VenusPoolBase = 0;
+    ULONGLONG m_VenusPoolSize = 0;
+    ULONGLONG m_PoolKmdBytes = 0;   // segment 2 (KMD-owned window): [0, m_PoolKmdBytes)
+    ULONGLONG m_PoolVidmmBytes = 0; // segment 1 (VidMm): [m_PoolKmdBytes, m_GuestPoolSize)
+    PUCHAR m_GuestPoolVa = NULL;
 
     // Shmem suballocator, lazy-initialized on first ShmemAlloc.
     RTL_BITMAP m_ShmemBitmap;

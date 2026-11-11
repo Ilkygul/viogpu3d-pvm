@@ -499,6 +499,7 @@ VioGpuAdapter::~VioGpuAdapter(void)
     HWClose();
     // protected VM: the frame segment's pool region first, then everything else rdmapool lent us
     frameSegment.Close();
+    PoolsClose();
     VioGpuRdmaShutdown();
     ExDeleteNPagedLookasideList(&m_PresentFenceLookaside);
 
@@ -939,8 +940,37 @@ template <typename DESC> static void FillApertureSegment(DESC *pDesc)
     pDesc->Flags.DirectFlip = TRUE;
 }
 
+// Protected VM: segment 1 is a CPU-visible, NON-aperture local segment over the upper part of the
+// shared GPU_GUEST pool.  VidMm commits 3D/GDI/shared surfaces there, so their pages are shared
+// memory the host can read (ATTACH_BACKING / TRANSFER) and the CPU maps straight through
+// CpuTranslatedAddress.  Replaces the system-memory aperture, whose pages are private to the guest.
+template <typename DESC> void VioGpuAdapter::FillPoolVidmmSegment(DESC *pDesc)
+{
+    pDesc->BaseAddress.QuadPart = (LONGLONG)PoolVidmmSegBase();
+    pDesc->Size = (SIZE_T)m_PoolVidmmBytes;
+    pDesc->CommitLimit = (SIZE_T)m_PoolVidmmBytes;
+    pDesc->CpuTranslatedAddress.QuadPart = (LONGLONG)(m_GuestPoolBase + m_PoolKmdBytes);
+    pDesc->Flags.Aperture = FALSE;
+    pDesc->Flags.CacheCoherent = TRUE;
+    pDesc->Flags.CpuVisible = TRUE;
+    pDesc->Flags.DirectFlip = TRUE;
+}
+
 template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
 {
+    if (m_PoolMode)
+    {
+        // protected VM: the KMD-owned window is the lower part of GPU_GUEST
+        pDesc->BaseAddress.QuadPart = VioGpuAdapter::SHMEM_GPU_BASE_VA;
+        pDesc->Size = (SIZE_T)m_PoolKmdBytes;
+        pDesc->CommitLimit = (SIZE_T)m_PoolKmdBytes;
+        pDesc->CpuTranslatedAddress.QuadPart = (LONGLONG)m_GuestPoolBase;
+        pDesc->Flags.Aperture = FALSE;
+        pDesc->Flags.CacheCoherent = TRUE;
+        pDesc->Flags.CpuVisible = TRUE;
+        pDesc->Flags.DirectFlip = TRUE;
+        return;
+    }
     pDesc->BaseAddress.QuadPart = VioGpuAdapter::SHMEM_GPU_BASE_VA;
     pDesc->Size = m_VioDev.shmem.length;
     pDesc->CommitLimit = m_VioDev.shmem.length;
@@ -981,12 +1011,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 info->Flags.Supports3d = virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_VIRGL) &&
                                          virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_RESOURCE_BLOB) &&
                                          virtio_is_feature_enabled(m_u64GuestFeatures, VIRTIO_GPU_F_CONTEXT_INIT);
-                info->Flags.HasShmem = m_VioDev.shmem.available;
+                // HasShmem: the KMD can hand out CPU windows for mappable blobs through RES_INFO.UserVa --
+                // from the host-visible BAR region normally, from the shared pools in a protected VM.
+                info->Flags.HasShmem = m_VioDev.shmem.available || m_PoolMode;
+                info->Flags.GuestVram = m_PoolMode ? 1 : 0;
                 // Wire selection: the UMD picks the BY_ID blob map/unmap wire
                 // from this.  Always set, but it stays a flag because the
                 // struct is UMD-facing ABI.
                 info->Flags.Wddm2 = 1;
                 info->Flags.Reserved = 0;
+                VioGpuRegLog("pool: adapterinfo HasShmem=%u GuestVram=%u\n", (UINT)info->Flags.HasShmem,
+                             (UINT)info->Flags.GuestVram);
                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
                 info->AdapterLuid = m_AdapterLuid;
                 return STATUS_SUCCESS;
@@ -1108,16 +1143,27 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
 
                 DXGK_QUERYSEGMENTOUT3 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT3 *)pQueryAdapterInfo->pOutputData;
-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
+                const UINT nbSegments = m_PoolMode ? (m_PoolKeepAperture ? 3 : 2) : (m_VioDev.shmem.available ? 2 : 1);
                 pSegmentInfo->NbSegment = nbSegments;
                 if (pSegmentInfo->pSegmentDescriptor)
                 {
                     RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, sizeof(DXGK_SEGMENTDESCRIPTOR3) * nbSegments);
                     FillPagingBufferInfo(pSegmentInfo);
-                    FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
-                    if (nbSegments == 2)
+                    if (m_PoolMode && !m_PoolKeepAperture)
+                    {
+                        FillPoolVidmmSegment(&pSegmentInfo->pSegmentDescriptor[0]);
+                    }
+                    else
+                    {
+                        FillApertureSegment(&pSegmentInfo->pSegmentDescriptor[0]);
+                    }
+                    if (nbSegments >= 2)
                     {
                         FillShmemSegment(&pSegmentInfo->pSegmentDescriptor[1]);
+                    }
+                    if (nbSegments == 3)
+                    {
+                        FillPoolVidmmSegment(&pSegmentInfo->pSegmentDescriptor[2]);
                     }
                 }
                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments\n", __FUNCTION__));
@@ -1141,7 +1187,7 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 }
 
                 DXGK_QUERYSEGMENTOUT4 *pSegmentInfo = (DXGK_QUERYSEGMENTOUT4 *)pQueryAdapterInfo->pOutputData;
-                const UINT nbSegments = m_VioDev.shmem.available ? 2 : 1;
+                const UINT nbSegments = m_PoolMode ? (m_PoolKeepAperture ? 3 : 2) : (m_VioDev.shmem.available ? 2 : 1);
 
                 // Two-call contract: the first call has NbSegment == 0 (and no
                 // descriptor array); report only the segment count and touch
@@ -1170,10 +1216,21 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                     return STATUS_INVALID_PARAMETER;
                 }
                 RtlZeroMemory(pSegmentInfo->pSegmentDescriptor, stride * nbSegments);
-                FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
-                if (nbSegments == 2)
+                if (m_PoolMode && !m_PoolKeepAperture)
+                {
+                    FillPoolVidmmSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
+                }
+                else
+                {
+                    FillApertureSegment((DXGK_SEGMENTDESCRIPTOR4 *)pSegmentInfo->pSegmentDescriptor);
+                }
+                if (nbSegments >= 2)
                 {
                     FillShmemSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + stride));
+                }
+                if (nbSegments == 3)
+                {
+                    FillPoolVidmmSegment((DXGK_SEGMENTDESCRIPTOR4 *)(pSegmentInfo->pSegmentDescriptor + 2 * stride));
                 }
 
                 DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s Requested segments (v4)\n", __FUNCTION__));
@@ -1546,7 +1603,8 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 }
                 KIRQL irql;
                 KeAcquireSpinLock(&m_PendingCreateLock, &irql);
-                pVioGpuEscape->ShmemInfo.TotalBytes = m_VioDev.shmem.available ? m_VioDev.shmem.length : 0;
+                pVioGpuEscape->ShmemInfo.TotalBytes =
+                    m_PoolMode ? m_PoolKmdBytes : (m_VioDev.shmem.available ? m_VioDev.shmem.length : 0);
                 pVioGpuEscape->ShmemInfo.UsedBytes = (ULONGLONG)m_ShmemUsedPages << PAGE_SHIFT;
                 KeReleaseSpinLock(&m_PendingCreateLock, irql);
                 break;
@@ -3013,6 +3071,7 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     VioGpuRdmaReset(); /* protected VM: vrings and staging from the restricted DMA pool */
+    PoolsInit();       /* protected VM: GPU_GUEST / VENUS_HOST windows */
     if (IsHardwareInit())
     {
         DbgPrint(TRACE_LEVEL_FATAL, ("Already Initialized\n"));
@@ -3049,6 +3108,8 @@ NTSTATUS VioGpuAdapter::VioGpuAdapterInit()
         AckFeature(VIRTIO_GPU_F_RESOURCE_UUID);
         AckFeature(VIRTIO_GPU_F_VIRGL);
         AckFeature(VIRTIO_GPU_F_RESOURCE_BLOB);
+        // DroidVM crosvm: blob mem entries become a guest-handle (udmabuf) for guest-allocated Venus memory.
+        AckFeature(VIRTIO_GPU_F_CREATE_GUEST_HANDLE);
 
         status = virtio_set_features(&m_VioDev, m_u64GuestFeatures);
         if (!NT_SUCCESS(status))
@@ -3850,6 +3911,187 @@ VioGpuAllocation *VioGpuAdapter::CookieMapLookup(ULONGLONG cookie)
     return found;
 }
 
+// ---- Gunyah protected VM pools ---------------------------------------------------------------
+
+static ULONGLONG ReadQwordParameter(PCWSTR name, ULONGLONG defaultValue)
+{
+    ULONGLONG value = defaultValue;
+    RTL_QUERY_REGISTRY_TABLE query[2];
+    RtlZeroMemory(query, sizeof(query));
+    query[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    query[0].Name = (PWSTR)name;
+    query[0].EntryContext = &value;
+    query[0].DefaultType = (REG_QWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_QWORD;
+    query[0].DefaultData = &defaultValue;
+    query[0].DefaultLength = sizeof(defaultValue);
+    NTSTATUS status = RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, L"VioGpu3D\\Parameters", query, NULL, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        value = defaultValue;
+    }
+    return value;
+}
+
+#define VIOGPU_DEFAULT_GPU_GUEST_BASE   0x168000000ull
+#define VIOGPU_DEFAULT_GPU_GUEST_SIZE   (512ull << 20)
+#define VIOGPU_DEFAULT_VENUS_HOST_BASE  0x188000000ull
+#define VIOGPU_DEFAULT_VENUS_HOST_SIZE  (128ull << 20)
+#define VIOGPU_DEFAULT_VIDMM_BYTES      (256ull << 20)
+
+VOID VioGpuAdapter::PoolsInit(VOID)
+{
+    PAGED_CODE();
+    if (m_PoolsTried)
+    {
+        return;
+    }
+    m_PoolsTried = TRUE;
+    if (!VioGpuRdmaActive())
+    {
+        VioGpuRegLog("pool: no rdmapool, not a protected VM: stock memory model\n");
+        return;
+    }
+    m_GuestPoolBase = ReadQwordParameter(L"GpuGuestPoolBase", VIOGPU_DEFAULT_GPU_GUEST_BASE);
+    m_GuestPoolSize = ReadQwordParameter(L"GpuGuestPoolSize", VIOGPU_DEFAULT_GPU_GUEST_SIZE);
+    m_VenusPoolBase = ReadQwordParameter(L"VenusHostPoolBase", VIOGPU_DEFAULT_VENUS_HOST_BASE);
+    m_VenusPoolSize = ReadQwordParameter(L"VenusHostPoolSize", VIOGPU_DEFAULT_VENUS_HOST_SIZE);
+    ULONGLONG vidmm = ReadQwordParameter(L"GpuGuestVidmmBytes", VIOGPU_DEFAULT_VIDMM_BYTES);
+    m_PoolKeepAperture = ReadQwordParameter(L"PoolKeepAperture", 0) != 0;
+
+    m_GuestPoolBase = (m_GuestPoolBase + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
+    m_GuestPoolSize &= ~(ULONGLONG)(PAGE_SIZE - 1);
+    m_VenusPoolBase = (m_VenusPoolBase + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
+    m_VenusPoolSize &= ~(ULONGLONG)(PAGE_SIZE - 1);
+    if (m_GuestPoolBase == 0 || m_GuestPoolSize < (32ull << 20))
+    {
+        VioGpuRegLog("pool: GPU_GUEST pool unusable (base %I64x size %I64x), stock memory model\n",
+                     m_GuestPoolBase,
+                     m_GuestPoolSize);
+        return;
+    }
+    // split: [0, kmd) KMD-owned window (segment 2), [kmd, size) VidMm (segment 1)
+    vidmm &= ~(ULONGLONG)(PAGE_SIZE - 1);
+    if (vidmm < (16ull << 20) || vidmm > m_GuestPoolSize - (16ull << 20))
+    {
+        vidmm = m_GuestPoolSize / 2;
+    }
+    m_PoolVidmmBytes = vidmm;
+    m_PoolKmdBytes = m_GuestPoolSize - vidmm;
+
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)m_GuestPoolBase;
+    // Cached (normal) mapping, like the restricted DMA pool: the host maps the same memory write-back.
+    m_GuestPoolVa = (PUCHAR)MmMapIoSpaceEx(pa, (SIZE_T)m_GuestPoolSize, PAGE_READWRITE);
+    if (m_GuestPoolVa == NULL)
+    {
+        VioGpuRegLog("pool: cannot map the GPU_GUEST pool for the CPU (paging FILL/TRANSFER will be no-ops)\n");
+    }
+    m_PoolMode = TRUE;
+    VioGpuRegLog("pool: keep-aperture=%u vidmm segment id %u\n", (UINT)m_PoolKeepAperture, PoolVidmmSegId());
+    VioGpuRegLog("pool: protected VM pools active. GPU_GUEST %I64x+%I64x (kmd window %I64x, vidmm seg1 %I64x @%I64x), "
+                 "VENUS_HOST %I64x+%I64x\n",
+                 m_GuestPoolBase,
+                 m_GuestPoolSize,
+                 m_PoolKmdBytes,
+                 m_PoolVidmmBytes,
+                 m_GuestPoolBase + m_PoolKmdBytes,
+                 m_VenusPoolBase,
+                 m_VenusPoolSize);
+    VioGpuRegLogFlush();
+}
+
+VOID VioGpuAdapter::PoolsClose(VOID)
+{
+    PAGED_CODE();
+    if (m_GuestPoolVa != NULL)
+    {
+        MmUnmapIoSpace(m_GuestPoolVa, (SIZE_T)m_GuestPoolSize);
+        m_GuestPoolVa = NULL;
+    }
+}
+
+ULONGLONG VioGpuAdapter::PoolVidmmPa(ULONGLONG segOffset) const
+{
+    if (!m_PoolMode)
+    {
+        return 0;
+    }
+    // Paging operations deliver segment-RELATIVE offsets, allocation lists segment-GLOBAL
+    // addresses; the segment is smaller than its base address, so the base disambiguates.
+    if (segOffset >= PoolVidmmSegBase())
+    {
+        segOffset -= PoolVidmmSegBase();
+    }
+    if (segOffset >= m_PoolVidmmBytes)
+    {
+        return 0;
+    }
+    return m_GuestPoolBase + m_PoolKmdBytes + segOffset;
+}
+
+ULONGLONG VioGpuAdapter::PoolPaFromSegment(UINT segmentId, ULONGLONG addr) const
+{
+    if (!m_PoolMode)
+    {
+        return 0;
+    }
+    if (segmentId == PoolVidmmSegId())
+    {
+        return PoolVidmmPa(addr);
+    }
+    if (segmentId == 2)
+    {
+        if (addr >= SHMEM_GPU_BASE_VA)
+        {
+            addr -= SHMEM_GPU_BASE_VA;
+        }
+        return addr < m_PoolKmdBytes ? m_GuestPoolBase + addr : 0;
+    }
+    return 0;
+}
+
+PUCHAR VioGpuAdapter::PoolVaFromPa(ULONGLONG pa, SIZE_T size) const
+{
+    if (m_GuestPoolVa == NULL || pa < m_GuestPoolBase || pa + size > m_GuestPoolBase + m_GuestPoolSize ||
+        pa + size < pa)
+    {
+        return NULL;
+    }
+    return m_GuestPoolVa + (pa - m_GuestPoolBase);
+}
+
+NTSTATUS VioGpuAdapter::PoolFill(UINT segmentId, ULONGLONG addr, SIZE_T size, ULONG pattern)
+{
+    PUCHAR va = PoolVaFromPa(PoolPaFromSegment(segmentId, addr), size);
+    if (va == NULL)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pattern == 0)
+    {
+        RtlZeroMemory(va, size);
+        return STATUS_SUCCESS;
+    }
+    PULONG p = (PULONG)va;
+    for (SIZE_T i = 0; i < size / sizeof(ULONG); i++)
+    {
+        p[i] = pattern;
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS VioGpuAdapter::PoolCopy(UINT dstSeg, ULONGLONG dstAddr, UINT srcSeg, ULONGLONG srcAddr, SIZE_T size)
+{
+    PUCHAR dst = PoolVaFromPa(PoolPaFromSegment(dstSeg, dstAddr), size);
+    PUCHAR src = PoolVaFromPa(PoolPaFromSegment(srcSeg, srcAddr), size);
+    if (dst == NULL || src == NULL)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    RtlMoveMemory(dst, src, size);
+    return STATUS_SUCCESS;
+}
+
 ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
 {
     ULONG pages = (ULONG)((size + PAGE_SIZE - 1) >> PAGE_SHIFT);
@@ -3861,12 +4103,12 @@ ULONGLONG VioGpuAdapter::ShmemAlloc(SIZE_T size)
     KeAcquireSpinLock(&m_PendingCreateLock, &irql);
     if (m_ShmemBitmapBuffer == NULL)
     {
-        if (!m_VioDev.shmem.available)
+        if (!m_PoolMode && !m_VioDev.shmem.available)
         {
             KeReleaseSpinLock(&m_PendingCreateLock, irql);
             return (ULONGLONG)-1;
         }
-        ULONG pageCount = (ULONG)(m_VioDev.shmem.length >> PAGE_SHIFT);
+        ULONG pageCount = (ULONG)(ShmemWindowBytes() >> PAGE_SHIFT);
         ULONG bytes = ((pageCount + 31) / 32) * sizeof(ULONG);
         m_ShmemBitmapBuffer = (PULONG)ExAllocatePoolZero(NonPagedPoolNx, bytes, VIOGPUTAG);
         if (m_ShmemBitmapBuffer == NULL)

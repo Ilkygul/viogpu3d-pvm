@@ -766,7 +766,7 @@ void CtrlQueue::CreateResource3D(UINT res_id, VIOGPU_RESOURCE_3D_OPTIONS *option
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size)
+bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size, ULONGLONG guestPa)
 {
     PAGED_CODE();
 
@@ -787,12 +787,31 @@ bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLO
     cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[ring_idx]*/);
     cmd->resource_id = res_id;
     cmd->blob_mem = options->blob_mem;
-    cmd->blob_flags = options->blob_flags;
+    // Only the three wire flags go to the host; UMD/KMD-private bits (PINNED, GUEST_VRAM, ...) stay here.
+    cmd->blob_flags = options->blob_flags & (VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE |
+                                             VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE);
     cmd->blob_id = options->blob_id;
     cmd->size = size;
 
-    // TODO
     cmd->nr_entries = 0;
+    if (guestPa != 0 && (options->blob_flags & VIOGPU_BLOB_FLAG_GUEST_VRAM))
+    {
+        // Protected VM: guest-supplied memory.  The run lives in the shared GPU_GUEST pool, so the
+        // host (crosvm) can build its udmabuf over it; one contiguous mem entry.
+        PGPU_MEM_ENTRY ent = reinterpret_cast<PGPU_MEM_ENTRY>(new (NonPagedPoolNx) BYTE[sizeof(GPU_MEM_ENTRY)]);
+        if (!ent)
+        {
+            ReleaseBuffer(vbuf);
+            return FALSE;
+        }
+        ent->addr = guestPa;
+        ent->length = (ULONG)size;
+        ent->padding = 0;
+        vbuf->data_buf = ent; // freed with the vbuf
+        vbuf->data_size = sizeof(GPU_MEM_ENTRY);
+        cmd->nr_entries = 1;
+        cmd->blob_flags |= VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE;
+    }
 
     NTSTATUS status;
 
@@ -1165,7 +1184,7 @@ BOOLEAN CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, v
 // RES_INFO placement escape) need the acknowledgement.  Because the control
 // queue is FIFO, the response also proves the resource's CREATE_BLOB was
 // processed, so a ring command may name the res_id as soon as this returns.
-BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset)
+BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo, ULONG *poolOffset)
 {
     PAGED_CODE();
 
@@ -1227,6 +1246,18 @@ BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offse
     {
         DbgPrint(TRACE_LEVEL_ERROR,
                  ("---> %s host rejected map res_id=%u resp=0x%x\n", __FUNCTION__, res_id, resp->type));
+    }
+    else
+    {
+        PGPU_RESP_MAP_INFO mi = (PGPU_RESP_MAP_INFO)vbuf->resp_buf;
+        if (mapInfo)
+        {
+            *mapInfo = (resp->type == VIRTIO_GPU_RESP_OK_MAP_INFO) ? mi->map_info : 0;
+        }
+        if (poolOffset)
+        {
+            *poolOffset = (resp->type == VIRTIO_GPU_RESP_OK_MAP_INFO) ? mi->pool_offset : 0;
+        }
     }
     ReleaseBuffer(vbuf);
 

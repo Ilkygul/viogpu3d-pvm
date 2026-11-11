@@ -190,6 +190,18 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     NTSTATUS EscapeReleaseWindow(VioGpuDevice *pDevice);
 
     VOID CreateBlob(UINT ctx_id);
+    // Issue RESOURCE_CREATE_BLOB for this blob on ctx_id and wait for the host.  For a Venus
+    // guest-vram blob (protected VM) this first places the blob in the shared GPU_GUEST pool and
+    // sends the pool pages as its mem entries.  The allocation lock must already be held (the
+    // in-Open() call site holds it); returns FALSE when the host or the placement refused.
+    BOOLEAN IssueCreateBlobLocked(UINT ctx_id);
+
+    // Protected VM: blob whose memory the guest supplies from the GPU_GUEST pool
+    // (VIOGPU_BLOB_FLAG_GUEST_VRAM); it needs no MAP_BLOB.
+    inline BOOL IsGuestVram() const
+    {
+        return m_IsBlob && m_GuestVram;
+    }
     // Return TRUE if a host map/unmap command was actually issued (so
     // complete_cb will fire from the queue-completion DPC), FALSE if the
     // blob was already in the requested state and no host round-trip --
@@ -210,6 +222,11 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // Shared/presentable blob-backed texture. Dimensions/format are retained
     // for DxgkDdiDescribeAllocation when another process opens the share.
     BOOL m_IsShared;
+    // Protected VM guest-vram blob (see IsGuestVram).
+    BOOL m_GuestVram = FALSE;
+    // Protected VM: physical address of the venus-pool window the host mapped this HOST3D blob at
+    // (from the MAP_BLOB answer); 0 until mapped.
+    ULONGLONG m_PoolPa = 0;
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT
@@ -254,6 +271,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     inline LinkedList<VioGpuDeviceAllocation>::Entry *Find(VioGpuDevice *pDevice);
     inline BOOLEAN MapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     inline BOOLEAN MapBlobSyncLocked(VioGpuDevice *pDevice);
+    BOOLEAN PlaceGuestVramLocked();
+    // Map the physical window [pa, pa+size) into the calling process (one mapping per process);
+    // returns the user VA or NULL.  Allocation lock held.
+    PVOID MapWindowForCurrentProcessLocked(ULONGLONG pa, SIZE_T size);
     inline BOOLEAN UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
 
     // Type-independent construction shared by every constructor.
@@ -314,6 +335,7 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // every page is known and detached the moment any page is invalidated.
     static constexpr ULONGLONG GPUMMU_PAGE_UNFILLED = ~0ull;
     ULONGLONG *m_GpummuPages = NULL;
+    BOOLEAN m_PrivatePagesLogged = FALSE;
     size_t m_GpummuFilled = 0;
 
     size_t m_DxPhysicalAddress;

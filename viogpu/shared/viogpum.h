@@ -103,7 +103,15 @@ typedef struct _VIOGPU_ADAPTERINFO
         UINT Supports3d : 1;
         UINT HasShmem : 1;
         UINT Wddm2 : 1;    // KMD uses GpuMmu: blob map/unmap takes the BY_ID wire
-        UINT Reserved : 29;
+        // Gunyah protected VM (DroidVM): the host cannot reach ordinary guest memory.
+        //  - Venus device memory (VkDeviceMemory) must be allocated as a GUEST_VRAM blob: set
+        //    VIOGPU_BLOB_FLAG_GUEST_VRAM (with USE_MAPPABLE) on a VIOGPU_BLOB_MEM_HOST3D blob.
+        //    The KMD places it in the shared GPU_GUEST pool, passes the pool pages as the blob's
+        //    mem entries (CREATE_GUEST_HANDLE) and hands the UMD a CPU mapping via RES_INFO.UserVa.
+        //  - Every mappable blob (transport shmem included) is mapped by the KMD and returned in
+        //    RES_INFO.UserVa; D3DKMTLock and the MAP_BLOB packet must not be used.
+        UINT GuestVram : 1;
+        UINT Reserved : 28;
     } Flags;
     ULONGLONG SupportedCapsetIDs;
     LUID AdapterLuid;
@@ -363,6 +371,11 @@ typedef struct _VIOGPU_RESOURCE_3D_OPTIONS
 #define VIOGPU_BLOB_FLAG_USE_SHAREABLE    0x0002
 //#define VIOGPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004
 #define VIOGPU_BLOB_FLAG_PINNED           0x0008
+// UMD -> KMD only (never on the virtio wire): a Venus device-memory blob whose pages the guest
+// supplies from the shared GPU_GUEST pool.  Valid only when VIOGPU_ADAPTERINFO.Flags.GuestVram is
+// set, with blob_mem VIOGPU_BLOB_MEM_HOST3D and blob_flags containing USE_MAPPABLE.  The KMD turns
+// it into HOST3D + VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE with the pool pages as mem entries.
+#define VIOGPU_BLOB_FLAG_GUEST_VRAM       0x0020
 // Blob that exists only so its resource owns a kernel allocation: no res_id is
 // minted for it, RESOURCE_CREATE_BLOB is never issued, and neither is the
 // RESOURCE_UNREF at destroy.  ID3D12Device1::SetResidencyPriority is serviced

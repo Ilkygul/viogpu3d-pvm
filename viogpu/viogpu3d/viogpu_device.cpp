@@ -818,8 +818,8 @@ VioGpuDeviceAllocation::VioGpuDeviceAllocation(VioGpuDevice *device, VioGpuAlloc
                                        create_ctx,
                                        device->m_Context.GetCapset(),
                                        allocation->m_Blob.Options.blob_id));
-        bool ok = m_pDevice->GetCtrlQueue()->CreateResourceBlob(m_pAllocation->GetId(), create_ctx, &m_pAllocation->m_Blob.Options, m_pAllocation->m_Size);
-        m_pAllocation->m_Blob.Created = ok;
+        // The allocation lock is held by VioGpuAllocation::Open() (our caller).
+        m_pAllocation->IssueCreateBlobLocked(create_ctx);
     }
 
     // Attach the resource to the opening device's virtio context.  For a

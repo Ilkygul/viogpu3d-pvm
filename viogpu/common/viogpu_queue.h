@@ -318,7 +318,9 @@ class CtrlQueue : public VioGpuQueue
 
     void CreateResource(UINT res_id, UINT format, UINT width, UINT height);
     void CreateResource3D(UINT res_id, VIOGPU_RESOURCE_3D_OPTIONS *options);
-    bool CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size);
+    // guestPa != 0 with VIOGPU_BLOB_FLAG_GUEST_VRAM: the blob's pages are the shared-pool run
+    // [guestPa, guestPa + size) -- sent as the single mem entry with CREATE_GUEST_HANDLE.
+    bool CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size, ULONGLONG guestPa = 0);
     void DestroyResource(UINT id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     void CtxResource(bool attach, UINT ctx_id, UINT res_id);
 
@@ -349,7 +351,9 @@ class CtrlQueue : public VioGpuQueue
 
     BOOLEAN ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     BOOLEAN ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
-    BOOLEAN ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset);
+    // mapInfo/poolOffset (optional) return the host's answer: with VIRTIO_GPU_MAP_INFO_POOL in
+    // *mapInfo the blob is resident in the pre-shared venus pool at byte *poolOffset.
+    BOOLEAN ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo = NULL, ULONG *poolOffset = NULL);
     BOOLEAN ResourceUnmapBlobSync(UINT res_id, UINT ctx_id);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);

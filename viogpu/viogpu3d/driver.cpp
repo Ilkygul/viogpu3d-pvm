@@ -730,6 +730,20 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
                                                allocation->GetId(),
                                                allocation->IsBlob()));
 
+                // Protected VM: segment 1 is real (shared) memory VidMm owns exclusively, so honour the
+                // fill with the CPU.  Segment 2 is the KMD-owned blob window (VidMm's offsets there are
+                // bookkeeping only) and is never touched.
+                if (pAdapter->PoolMode() && pBuildPagingBuffer->Fill.Destination.SegmentId == pAdapter->PoolVidmmSegId())
+                {
+                    NTSTATUS fillStatus = pAdapter->PoolFill(pAdapter->PoolVidmmSegId(),
+                                                             pBuildPagingBuffer->Fill.Destination.SegmentAddress.QuadPart,
+                                                             pBuildPagingBuffer->Fill.FillSize,
+                                                             pBuildPagingBuffer->Fill.FillPattern);
+                    if (!NT_SUCCESS(fillStatus))
+                    {
+                        DbgPrint(TRACE_LEVEL_ERROR, ("%s pool fill failed 0x%x\n", __FUNCTION__, fillStatus));
+                    }
+                }
                 return STATUS_SUCCESS;
             }
         case DXGK_OPERATION_DISCARD_CONTENT:
@@ -791,6 +805,22 @@ VioGpu3DBuildPagingBuffer(_In_ CONST HANDLE hAdapter, _In_ DXGKARG_BUILDPAGINGBU
                 // will be served zero-initialised at the next attach
                 // and we lose the original content rather than
                 // wedging the scheduler.
+                // Protected VM: a move inside VidMm's shared segment 1 is a plain CPU copy.  Moves to or
+                // from private system memory cannot happen (no eviction target is offered).
+                if (pAdapter->PoolMode() && pBuildPagingBuffer->Transfer.Source.SegmentId == pAdapter->PoolVidmmSegId() &&
+                    pBuildPagingBuffer->Transfer.Destination.SegmentId == pAdapter->PoolVidmmSegId())
+                {
+                    NTSTATUS copyStatus = pAdapter->PoolCopy(pAdapter->PoolVidmmSegId(),
+                                                             pBuildPagingBuffer->Transfer.Destination.SegmentAddress.QuadPart,
+                                                             pAdapter->PoolVidmmSegId(),
+                                                             pBuildPagingBuffer->Transfer.Source.SegmentAddress.QuadPart,
+                                                             pBuildPagingBuffer->Transfer.TransferSize);
+                    if (NT_SUCCESS(copyStatus))
+                    {
+                        return STATUS_SUCCESS;
+                    }
+                    DbgPrint(TRACE_LEVEL_ERROR, ("%s pool copy failed 0x%x\n", __FUNCTION__, copyStatus));
+                }
                 DbgPrint(TRACE_LEVEL_WARNING,
                          ("<--- %s (transfer, content lost)\n", __FUNCTION__));
                 return STATUS_SUCCESS;
