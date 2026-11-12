@@ -464,6 +464,7 @@ VioGpuAllocation::~VioGpuAllocation(void)
                  ("---> %s res_id=%d still-mapped blob at destroy (host unmaps at unref)\n",
                   __FUNCTION__, m_Id));
         m_Blob.Mapped = FALSE;
+        m_HostPoolMap = FALSE;
     }
 
     if (m_IsImport)
@@ -871,6 +872,7 @@ BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
         }
         m_PoolPa = m_adapter->VenusPoolBase() + poolOffset;
         m_Blob.Mapped = TRUE;
+        m_HostPoolMap = TRUE;
         VioGpuRegLog("venuspool: res_id=%u map_info=0x%x pool_offset=0x%x -> pa %I64x size=%I64u\n",
                      m_Id, mapInfo, poolOffset, m_PoolPa, m_Size);
         return TRUE;
@@ -900,6 +902,14 @@ BOOLEAN VioGpuAllocation::UnmapBlobLocked(UINT ctx_id, void (*complete_cb)(void 
         // Phantom allocations (shared-registry backing) never created a
         // host blob; an UNMAP_BLOB for res_id 0 is the guest-error spam
         // in the QEMU log.  Clear local state and skip the wire op.
+        m_Blob.Mapped = FALSE;
+        return FALSE;
+    }
+    if (m_HostPoolMap)
+    {
+        // Pool-resident window: nothing is mapped host-side, so there is nothing to unmap (and a
+        // second UNMAP_BLOB would draw ErrUnspec).  Drop the local state only.
+        m_HostPoolMap = FALSE;
         m_Blob.Mapped = FALSE;
         return FALSE;
     }
@@ -1665,6 +1675,13 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
 
         if (poolHost)
         {
+            // Only a created blob can be mapped (MAP_BLOB on a res_id the host has not seen is an
+            // INVALID_RESOURCE_ID); report "not created yet" and let the UMD's RES_INFO retry.
+            if (!m_Blob.Created && !m_Blob.Mapped)
+            {
+                resInfo->UserVa = 0;
+                goto fill;
+            }
             // Needs the host's answer first (the window's address is the answer).
             if (!m_Blob.Mapped && pMapDevice != NULL && !MapBlobSyncLocked(pMapDevice))
             {
@@ -1839,6 +1856,11 @@ NTSTATUS VioGpuAllocation::EscapeReleaseWindow(VioGpuDevice *pDevice)
     // and a still-live host mapping would alias it (the plain queued unmap
     // can be dropped silently on a full virtqueue).  The ctx comes from
     // the caller's device binding, as the by-id unmap packet path uses.
+    if (m_Blob.Mapped && m_HostPoolMap)
+    {
+        m_HostPoolMap = FALSE; // pool window: no host mapping to acknowledge
+        m_Blob.Mapped = FALSE;
+    }
     if (m_Blob.Mapped)
     {
         UINT ctxId = 0;

@@ -227,6 +227,10 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // Protected VM: physical address of the venus-pool window the host mapped this HOST3D blob at
     // (from the MAP_BLOB answer); 0 until mapped.
     ULONGLONG m_PoolPa = 0;
+    // The host answered MAP_BLOB with VIRTIO_GPU_MAP_INFO_POOL: the blob is a window of the pre-shared
+    // VENUS_HOST pool and there is no host mapping to tear down (crosvm's UNMAP_BLOB only drops its
+    // pool_offset record, and answers ErrUnspec when asked twice or for a blob it never mapped).
+    BOOL m_HostPoolMap = FALSE;
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT
