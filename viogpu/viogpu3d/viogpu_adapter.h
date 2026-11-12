@@ -116,6 +116,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     //                                      manages as segment 1; the rest is the KMD-owned window
     //                                      (segment 2) that ShmemAlloc suballocates for blobs.
     BOOLEAN PoolMode() const { return m_PoolMode; }
+    BOOLEAN PoolKeepAperture() const { return m_PoolKeepAperture; }
     BOOLEAN HasVenusPool() const { return m_PoolMode && m_VenusPoolSize != 0; }
     ULONGLONG VenusPoolBase() const { return m_VenusPoolBase; }
     ULONGLONG VenusPoolSize() const { return m_VenusPoolSize; }

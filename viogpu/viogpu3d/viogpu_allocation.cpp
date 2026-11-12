@@ -1387,11 +1387,13 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             if (allocation->IsGuestBlob())
             {
                 //allocationInfo->EvictionSegmentSet = 0b01; // don't use apperture for eviction
-                allocationInfo->PreferredSegment.SegmentId0 = 1;
+                // Pool mode: the pool segment (id 1, or 3 when the aperture is kept), never the private aperture.
+                allocationInfo->PreferredSegment.SegmentId0 = adapter->PoolMode() ? adapter->PoolVidmmSegId() : 1;
                 allocationInfo->PreferredSegment.Direction0 = 0;
                 allocationInfo->Flags.CpuVisible = TRUE;
-                allocationInfo->SupportedReadSegmentSet = 0b1;
-                allocationInfo->SupportedWriteSegmentSet = 0b1;
+                allocationInfo->SupportedReadSegmentSet =
+                    adapter->PoolMode() ? (1u << (adapter->PoolVidmmSegId() - 1)) : 0b1;
+                allocationInfo->SupportedWriteSegmentSet = allocationInfo->SupportedReadSegmentSet;
             }
             else
             {
@@ -1444,25 +1446,25 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
                                            resourceExchange->OptionsShared.width,
                                            resourceExchange->OptionsShared.height,
                                            resourceExchange->OptionsShared.primary));
-            allocationInfo->EvictionSegmentSet = adapter->PoolMode() ? 0 : 1;
-            allocationInfo->PreferredSegment.SegmentId0 = adapter->PoolMode() ? adapter->PoolVidmmSegId() : 1;
+            // The content of a shared texture is the host's dmabuf; the guest pages behind the allocation
+            // are never read or written.  dxgkrnl/VidMm wants a shareable allocation to be able to live
+            // in (and be evicted to) system-memory aperture, exactly the configuration that works without
+            // pools, so a SHARED allocation uses the aperture whenever pool mode keeps one (PoolKeepAperture,
+            // the default).  Private guest pages are fine here precisely because the host never reads them.
+            // Without an aperture segment (PoolKeepAperture=0) fall back to the pool segment.
+            const BOOLEAN sharedInAperture = !adapter->PoolMode() || adapter->PoolKeepAperture();
+            allocationInfo->EvictionSegmentSet = sharedInAperture ? 1 : 0;
+            allocationInfo->PreferredSegment.SegmentId0 = sharedInAperture ? 1 : adapter->PoolVidmmSegId();
             allocationInfo->PreferredSegment.Direction0 = 0;
             allocationInfo->Flags.CpuVisible = TRUE;
-            // Non-primary shared surfaces are the composited window surfaces
-            // that dxgkrnl's GDI present copy writes into, so they take
-            // write-back backing for the same reason as the coherent 3D case
-            // above.  Cached is not permitted on a primary surface, so
-            // scanout primaries keep the write-combined default.
-            // Pool mode: the segment is a CPU-visible, cache-coherent LOCAL (non-aperture) segment over
-            // shared pool memory.  Cached selects write-back for system-memory (aperture) backing; asking
-            // for it on an allocation whose only segment is a non-aperture one is a combination the video
-            // memory manager may refuse (the same class of rejection as the AccessedPhysically/
-            // ExplicitResidencyNotification case in the BLOB branch), so leave the flag clear there.
-            if (!resourceExchange->OptionsShared.primary && !adapter->PoolMode())
+            // Non-primary shared surfaces are the composited window surfaces that dxgkrnl's GDI present
+            // copy writes into, so they take write-back backing.  Cached is not permitted on a primary
+            // surface, nor meaningful in a non-aperture pool segment.
+            if (!resourceExchange->OptionsShared.primary && sharedInAperture)
             {
                 allocationInfo->Flags.Cached = TRUE;
             }
-            allocationInfo->SupportedReadSegmentSet = adapter->PoolMode() ? (1u << (adapter->PoolVidmmSegId() - 1)) : 0b1;
+            allocationInfo->SupportedReadSegmentSet = sharedInAperture ? 0b1 : (1u << (adapter->PoolVidmmSegId() - 1));
             allocationInfo->SupportedWriteSegmentSet = allocationInfo->SupportedReadSegmentSet;
             if (resourceExchange->OptionsShared.primary)
             {
@@ -1507,6 +1509,13 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
 
     auto lock_guard = LockGuard();
 
+    static volatile LONG s_describeLogs = 0;
+    if (m_IsShared && InterlockedIncrement(&s_describeLogs) <= 32)
+    {
+        VioGpuRegLog("describealloc: SHARED res_id=%u %ux%u dxgiFmt=%u primary=%u\n", m_Id, m_SharedWidth,
+                     m_SharedHeight, m_SharedFormat, (UINT)m_IsPrimary);
+    }
+
     if (m_IsShared) {
         // Host-COM-backed share: dimensions/format come from the producer's
         // descriptor; there is no virtio resource to query.
@@ -1525,7 +1534,7 @@ NTSTATUS VioGpuAllocation::DescribeAllocation(DXGKARG_DESCRIBEALLOCATION *pDescr
 
     if (m_IsBlob) {
         if (!m_Blob.InfoValid) {
-            DbgPrint(TRACE_LEVEL_ERROR, ("<---> %s res_id=%d does not have valid info\n", __FUNCTION__, m_Id));
+            VioGpuRegLog("describealloc: REJECT STATUS_INVALID_PARAMETER res_id=%u blob without valid info\n", m_Id);
             return STATUS_INVALID_PARAMETER;
         }
 

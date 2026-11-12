@@ -683,10 +683,15 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
              ("---> %s n=%u flags=0x%x\n", __FUNCTION__,
               pOpenAllocation->NumAllocations, pOpenAllocation->Flags.Value));
 
+    static volatile LONG s_openLogs = 0;
     for (UINT i = 0; i < pOpenAllocation->NumAllocations; i++)
     {
         DXGK_OPENALLOCATIONINFO *openAllocationInfo = &pOpenAllocation->pOpenAllocation[i];
         VioGpuAllocation *allocation = NULL;
+        const BOOLEAN logOpen = InterlockedIncrement(&s_openLogs) <= 48 ||
+                                (openAllocationInfo->PrivateDriverDataSize >= sizeof(ULONG) &&
+                                 openAllocationInfo->pPrivateDriverData != NULL &&
+                                 *(ULONG *)openAllocationInfo->pPrivateDriverData == VIOGPU_RESOURCE_TYPE_SHARED);
         if (openAllocationInfo->pPrivateDriverData != NULL &&
             openAllocationInfo->PrivateDriverDataSize >= sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE))
         {
@@ -751,6 +756,12 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
             // Only an error for UMD-owned allocations, where the deferred blob
             // create then silently never happens and the UMD device init
             // loops; VidMm-internal opens are routine.
+            if (logOpen)
+            {
+                VioGpuRegLog("openalloc: hAllocation=%x create=%u privSize=%u -> NO driver allocation (NULL device handle)\n",
+                             openAllocationInfo->hAllocation, (UINT)pOpenAllocation->Flags.Create,
+                             openAllocationInfo->PrivateDriverDataSize);
+            }
             DbgPrint(openAllocationInfo->PrivateDriverDataSize != 0 ? TRACE_LEVEL_ERROR : TRACE_LEVEL_VERBOSE,
                      ("<---> %s hAllocation=%x privsize=%u priv=%p no driver allocation; NULL device handle\n",
                       __FUNCTION__, openAllocationInfo->hAllocation,
@@ -760,6 +771,12 @@ NTSTATUS VioGpuDevice::OpenAllocation(_In_ CONST DXGKARG_OPENALLOCATION *pOpenAl
             continue;
         }
         VioGpuDeviceAllocation *devAlloc = allocation->Open(this);
+        if (logOpen)
+        {
+            VioGpuRegLog("openalloc: hAllocation=%x res_id=%u create=%u privSize=%u -> devAlloc=%p\n",
+                         openAllocationInfo->hAllocation, allocation->GetId(), (UINT)pOpenAllocation->Flags.Create,
+                         openAllocationInfo->PrivateDriverDataSize, devAlloc);
+        }
         openAllocationInfo->hDeviceSpecificAllocation = devAlloc->ToHandle();
         // Remember the D3DKMT-handle binding: escapes and later DDIs
         // resolve through it when GetHandleData draws a blank (WDDM2).

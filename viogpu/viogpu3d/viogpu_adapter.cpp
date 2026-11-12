@@ -4083,7 +4083,7 @@ VOID VioGpuAdapter::PoolsInit(VOID)
         m_VenusPoolSize = 0;
     }
     ULONGLONG vidmm = ReadQwordParameter(L"GpuGuestVidmmBytes", VIOGPU_DEFAULT_VIDMM_BYTES);
-    m_PoolKeepAperture = ReadQwordParameter(L"PoolKeepAperture", 0) != 0;
+    m_PoolKeepAperture = ReadQwordParameter(L"PoolKeepAperture", 1) != 0;
 
     m_GuestPoolBase = (m_GuestPoolBase + PAGE_SIZE - 1) & ~(ULONGLONG)(PAGE_SIZE - 1);
     m_GuestPoolSize &= ~(ULONGLONG)(PAGE_SIZE - 1);
