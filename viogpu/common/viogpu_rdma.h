@@ -43,6 +43,11 @@ void VioGpuRdmaStageFree(PVOID va, SIZE_T bytes);
 /* A contiguous pool region (PASSIVE_LEVEL), for the frame segment. */
 PVOID VioGpuRdmaRegionAlloc(SIZE_T bytes, PHYSICAL_ADDRESS *pa);
 void VioGpuRdmaRegionFree(PVOID va);
+/* Memory the host can read in a protected VM besides the rdma pool regions: register the GPU_GUEST /
+ * VENUS_HOST windows, then ask whether a backing entry [pa, pa+len) lies inside one shared region
+ * (crosvm refuses ATTACH_BACKING with ErrUnspec otherwise). TRUE when not in a protected VM. */
+void VioGpuRdmaAddSharedRange(ULONGLONG base, ULONGLONG bytes);
+BOOLEAN VioGpuRdmaPaIsHostVisible(ULONGLONG pa, ULONGLONG len);
 /* Driver teardown (PASSIVE_LEVEL): give every region back to the pool; the next load starts clean. */
 void VioGpuRdmaShutdown(void);
 

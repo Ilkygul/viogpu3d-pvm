@@ -189,6 +189,56 @@ static PVOID RegionAllocLocked(SIZE_T bytes, PHYSICAL_ADDRESS *pa)
     return NULL;
 }
 
+/* Host-visible memory outside the rdma pool (the GPU_GUEST / VENUS_HOST windows). */
+#define VIOGPU_RDMA_MAX_SHARED 4
+static struct
+{
+    ULONGLONG Base;
+    ULONGLONG Bytes;
+} g_Shared[VIOGPU_RDMA_MAX_SHARED];
+
+void VioGpuRdmaAddSharedRange(ULONGLONG base, ULONGLONG bytes)
+{
+    for (int i = 0; i < VIOGPU_RDMA_MAX_SHARED; i++)
+    {
+        if (g_Shared[i].Bytes == 0 || g_Shared[i].Base == base)
+        {
+            g_Shared[i].Base = base;
+            g_Shared[i].Bytes = bytes;
+            return;
+        }
+    }
+}
+
+BOOLEAN VioGpuRdmaPaIsHostVisible(ULONGLONG pa, ULONGLONG len)
+{
+    if (!g_Open)
+    {
+        return TRUE; /* not a protected VM: nothing to check */
+    }
+    if (len == 0 || pa + len < pa)
+    {
+        return FALSE;
+    }
+    /* crosvm accepts an entry only when it lies inside ONE shared region. */
+    for (int i = 0; i < VIOGPU_RDMA_MAX_REGIONS; i++)
+    {
+        if (g_Regions[i].Va != NULL && pa >= (ULONGLONG)g_Regions[i].Pa.QuadPart &&
+            pa + len <= (ULONGLONG)g_Regions[i].Pa.QuadPart + g_Regions[i].Bytes)
+        {
+            return TRUE;
+        }
+    }
+    for (int i = 0; i < VIOGPU_RDMA_MAX_SHARED; i++)
+    {
+        if (g_Shared[i].Bytes != 0 && pa >= g_Shared[i].Base && pa + len <= g_Shared[i].Base + g_Shared[i].Bytes)
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 BOOLEAN VioGpuRdmaOpen(void)
 {
     if (g_Tried)
@@ -245,7 +295,10 @@ void VioGpuRdmaReset(void)
         return;
     }
     g_RingUsed = 0;
-    RtlZeroMemory(g_RingVa, VIOGPU_RDMA_RING_PAGES * PAGE_SIZE);
+    /* NOT zeroed here: this runs at the start of an adapter init, before VirtIoDeviceInit has reset the
+     * device. A device still holding the previous load's rings (same addresses) would see avail->idx
+     * jump back to 0 and walk thousands of zeroed entries: crosvm's "invalid zero-length descriptor
+     * chain". VioGpuRdmaRingAlloc zeroes each ring when the (already reset) device gets it. */
     /* The staging bitmap is deliberately NOT rewound here: a power cycle re-runs the adapter init
      * while vbufs queued before it may still be in flight and will return their runs. */
 }
@@ -402,6 +455,7 @@ void VioGpuRdmaShutdown(void)
     }
     g_RingVa = NULL;
     g_StageVa = NULL;
+    RtlZeroMemory(g_Shared, sizeof(g_Shared));
     g_Open = FALSE;
     g_Tried = FALSE;
 }

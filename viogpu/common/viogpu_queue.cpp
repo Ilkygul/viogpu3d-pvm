@@ -1531,7 +1531,15 @@ static BOOLEAN BuildVbufSGList(PGPU_VBUFFER buf, VirtIOBufferDescriptor sg[], UI
         }
         *poutcnt = outcnt;
         *pincnt = incnt;
-        return (outcnt + incnt) != 0;
+        /* A device-readable part is mandatory (the command itself); a chain without one, or with
+         * only zero-length parts, is what crosvm rejects as "invalid zero-length descriptor chain". */
+        if (outcnt == 0)
+        {
+            VioGpuRegLog("queue: vbuf %p has no command bytes (size %d data %u resp %d), not queued\n",
+                         buf, buf->size, buf->data_size, buf->resp_size);
+            return FALSE;
+        }
+        return TRUE;
     }
 
     if (buf->size > PAGE_SIZE)
@@ -1724,9 +1732,22 @@ void CtrlQueue::SubmitPendingLocked()
         PGPU_VBUFFER buf = CONTAINING_RECORD(m_PendingBufs.Flink, GPU_VBUFFER, pending_entry);
         UINT outcnt = 0, incnt = 0;
 
-        // Cannot fail: the vbuf built successfully when it was parked and
-        // BuildVbufSGList is deterministic in the vbuf's fields.
-        BuildVbufSGList(buf, sg, &outcnt, &incnt);
+        // The vbuf built successfully when it was parked and BuildVbufSGList is deterministic in
+        // the vbuf's fields; never hand the ring an empty chain if that ever stops being true.
+        if (!BuildVbufSGList(buf, sg, &outcnt, &incnt) || outcnt + incnt == 0)
+        {
+            RemoveHeadList(&m_PendingBufs);
+            UnstageVbuf(buf, FALSE);
+            if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+            {
+                buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+            }
+            if (buf->auto_release)
+            {
+                ReleaseBuffer(buf);
+            }
+            continue;
+        }
         if (AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0) < 0)
         {
             break;
