@@ -32,7 +32,7 @@
     extern "C" void VioGpuRegLog(const char *fmt, ...);
     __forceinline bool VioGpuRegLogOn(int level)
     {
-        return level <= TRACE_LEVEL_VERBOSE; // test: everything (bring-up)
+        return level <= TRACE_LEVEL_WARNING; // bring-up: warnings and worse (pool:/rdma: lines are always logged)
     }
 #define DbgPrint(Level, MSG) \
     { \
