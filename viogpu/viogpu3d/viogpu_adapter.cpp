@@ -4024,12 +4024,12 @@ static VOID FindDrvmPools(ULONGLONG *guestBase, ULONGLONG *guestSize, ULONGLONG 
                     }
                     ULONGLONG b = (ULONGLONG)d->u.Memory.Start.QuadPart, z = RtlCmDecodeMemIoResource(d, NULL);
                     VioGpuRegLog("pool: found %ws at %I64x+%I64x\n", inst, b, z);
-                    if (wcsstr(inst, L"GPU_GUEST") != NULL)
+                    if (wcsstr(inst, L"GPU_GUEST") != NULL || wcsstr(inst, L"gpu_guest") != NULL)
                     {
                         *guestBase = b;
                         *guestSize = z;
                     }
-                    else if (wcsstr(inst, L"VENUS_HOST") != NULL)
+                    else if (wcsstr(inst, L"VENUS_HOST") != NULL || wcsstr(inst, L"venus_host") != NULL)
                     {
                         *venusBase = b;
                         *venusSize = z;
