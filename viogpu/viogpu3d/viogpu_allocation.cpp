@@ -556,10 +556,9 @@ BOOLEAN VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t page
         ents[i].padding = 0;
     }
 
-    m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)pageCount);
-    m_BackingAttached = TRUE;
+    m_BackingAttached = m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)pageCount);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return TRUE;
+    return m_BackingAttached;
 }
 
 void VioGpuAllocation::DetachBacking()
@@ -742,8 +741,7 @@ void VioGpuAllocation::HandlePageTableUpdate(const DXGK_BUILDPAGINGBUFFER_UPDATE
             ents[nents].padding = 0;
             nents++;
         }
-        m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)nents);
-        m_BackingAttached = TRUE;
+        m_BackingAttached = m_adapter->ctrlQueue.AttachBacking(m_Id, ents, (UINT)nents);
         DbgPrint(TRACE_LEVEL_VERBOSE, ("%s attach res_id=%d pages=%zu\n", __FUNCTION__, m_Id, total));
     }
 }

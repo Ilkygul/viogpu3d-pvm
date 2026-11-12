@@ -989,7 +989,7 @@ void CtrlQueue::TransferToHost3D(UINT res_id, GPU_BOX *box)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
+BOOLEAN CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
 {
     PAGED_CODE();
 
@@ -997,6 +997,31 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
 
     PGPU_RES_ATTACH_BACKING cmd;
     PGPU_VBUFFER vbuf;
+
+    // Protected VM: crosvm resolves every entry with get_slice_at_addr, which refuses (ErrUnspec)
+    // anything outside a shared region -- private guest RAM (MDL pages), or an entry that crosses a
+    // region end. An empty list is refused too ("missing data"). Do not send what cannot succeed;
+    // the caller learns the resource has no host backing.
+    if (nents == 0)
+    {
+        delete[] reinterpret_cast<PBYTE>(ents);
+        return FALSE;
+    }
+    if (VioGpuRdmaActive())
+    {
+        for (UINT i = 0; i < nents; i++)
+        {
+            if (!VioGpuRdmaPaIsHostVisible(ents[i].addr, ents[i].length))
+            {
+                VioGpuRegLog("queue: res_id=%u backing entry %u/%u %I64x+%x is not host-visible memory, "
+                             "ATTACH_BACKING not sent\n",
+                             res_id, i, nents, ents[i].addr, ents[i].length);
+                delete[] reinterpret_cast<PBYTE>(ents);
+                return FALSE;
+            }
+        }
+    }
+
     cmd = (PGPU_RES_ATTACH_BACKING)AllocCmd(&vbuf, sizeof(*cmd));
     if (!cmd)
     {
@@ -1004,7 +1029,7 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
         // path it is freed with the vbuf, so free it here too rather than
         // leaking it back to a caller that has already forgotten it.
         delete[] reinterpret_cast<PBYTE>(ents);
-        return;
+        return FALSE;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));
 
@@ -1018,6 +1043,7 @@ void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
     QueueBuffer(vbuf);
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
 }
 
 void CtrlQueue::CtxResource(bool attach, UINT ctx_id, UINT res_id)

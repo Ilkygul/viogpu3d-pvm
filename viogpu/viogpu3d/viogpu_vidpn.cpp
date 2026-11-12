@@ -931,10 +931,10 @@ BOOLEAN VioGpuVidPN::GpuObjectAttach(UINT res_id, VioGpuObj *obj)
         ents[i].padding = 0;
     }
 
-    m_pAdapter->ctrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
+    BOOLEAN attached = m_pAdapter->ctrlQueue.AttachBacking(res_id, ents, sgl->NumberOfElements);
     obj->SetId(res_id);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return TRUE;
+    return attached;
 }
 
 NTSTATUS VioGpuVidPN::EscapeCustomResoulution(VIOGPU_DISP_MODE *resolution)

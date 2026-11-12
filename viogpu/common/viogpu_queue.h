@@ -346,7 +346,7 @@ class CtrlQueue : public VioGpuQueue
     void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y);
     void TransferToHost3D(UINT res_id, GPU_BOX *box);
 
-    void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
+    BOOLEAN AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);
     void DetachBacking(UINT id);
 
     BOOLEAN ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx);

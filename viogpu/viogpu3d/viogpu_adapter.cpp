@@ -4112,6 +4112,12 @@ VOID VioGpuAdapter::PoolsInit(VOID)
         VioGpuRegLog("pool: cannot map the GPU_GUEST pool for the CPU (paging FILL/TRANSFER will be no-ops)\n");
     }
     m_PoolMode = TRUE;
+    /* Backing entries must lie in memory the host may read: the pools are, private RAM is not. */
+    VioGpuRdmaAddSharedRange(m_GuestPoolBase, m_GuestPoolSize);
+    if (m_VenusPoolSize != 0)
+    {
+        VioGpuRdmaAddSharedRange(m_VenusPoolBase, m_VenusPoolSize);
+    }
     VioGpuRegLog("pool: keep-aperture=%u vidmm segment id %u\n", (UINT)m_PoolKeepAperture, PoolVidmmSegId());
     VioGpuRegLog("pool: protected VM pools active. GPU_GUEST %I64x+%I64x (kmd window %I64x, vidmm seg1 %I64x @%I64x), "
                  "VENUS_HOST %I64x+%I64x\n",
