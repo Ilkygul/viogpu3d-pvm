@@ -540,6 +540,17 @@ BOOLEAN VioGpuAllocation::AttachBacking(MDL *pMDL, size_t pageCount, size_t page
     m_pageCount = pageCount;
     m_pageOffset = pageOffset;
 
+    if (m_adapter->PoolMode())
+    {
+        // Protected VM: an MDL names ordinary guest pages, which are private to the guest -- the
+        // host cannot read them and ATTACH_BACKING over them would be refused (or worse, accepted
+        // and read as zeroes).  Everything the host must see is placed in the shared pools; a
+        // host-allocated blob (shared/imported texture, transport shmem) needs no guest backing.
+        VioGpuRegLog("backing: res_id=%u MDL-backed attach refused in pool mode (%Iu pages, blob=%d)\n",
+                     m_Id, pageCount, m_IsBlob);
+        return FALSE;
+    }
+
     GPU_MEM_ENTRY *ents = new (NonPagedPoolNx) GPU_MEM_ENTRY[pageCount];
     if (ents == NULL)
     {
@@ -1015,6 +1026,15 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
         rect.width = info.width;
         rect.height = info.height;
 
+        if (m_adapter->PoolMode())
+        {
+            static volatile LONG s_scanoutLogs = 0;
+            if (InterlockedIncrement(&s_scanoutLogs) <= 8)
+            {
+                VioGpuRegLog("scanout: SET_SCANOUT_BLOB scan=%u res_id=%u %ux%u fmt=%u stride=%u (host blob, no guest memory)\n",
+                             scan_id, m_Id, info.width, info.height, info.format, info.strides[0]);
+            }
+        }
         m_adapter->ctrlQueue.SetScanoutBlob(scan_id, m_Id, rect, info);
         // TODO: guard with IsGuest()
         m_adapter->ctrlQueue.ResFlush(m_Id, rect);
@@ -1212,6 +1232,28 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     }
 
     allocationInfo->hAllocation = allocation->ToHandle();
+    if (adapter->PoolMode() &&
+        (resourceExchange->Type == VIOGPU_RESOURCE_TYPE_SHARED || resourceExchange->Type == VIOGPU_RESOURCE_TYPE_IMPORT))
+    {
+        // Host-owned memory: nothing of this allocation is ever shared with the host from the guest side.
+        static volatile LONG s_hostBlobLogs = 0;
+        if (InterlockedIncrement(&s_hostBlobLogs) <= 24)
+        {
+            if (resourceExchange->Type == VIOGPU_RESOURCE_TYPE_SHARED)
+            {
+                VioGpuRegLog("hostblob: SHARED res_id=%u blob_id=%I64x ctx=%u %ux%u primary=%u size=%I64u (host-owned, no guest backing)\n",
+                             allocation->GetId(), resourceExchange->OptionsShared.blob_id,
+                             resourceExchange->OptionsShared.create_ctx_id, resourceExchange->OptionsShared.width,
+                             resourceExchange->OptionsShared.height, (UINT)resourceExchange->OptionsShared.primary,
+                             resourceExchange->Size);
+            }
+            else
+            {
+                VioGpuRegLog("hostblob: IMPORT res_id=%u size=%I64u (alias of an existing host resource)\n",
+                             allocation->GetId(), resourceExchange->Size);
+            }
+        }
+    }
     // The lookup cookie rides after the exchange when the authoring side wrote
     // one; its presence is signalled by the private-data size.  Recording it
     // here is what lets cross-process opens resolve when every handle path

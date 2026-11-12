@@ -111,7 +111,14 @@ typedef struct _VIOGPU_ADAPTERINFO
         //  - Every mappable blob (transport shmem included) is mapped by the KMD and returned in
         //    RES_INFO.UserVa; D3DKMTLock and the MAP_BLOB packet must not be used.
         UINT GuestVram : 1;
-        UINT Reserved : 28;
+        //  - HasVenusPool: the VENUS_HOST pool is active.  A HOST3D blob_id 0 transport shmem (no
+        //    GUEST_VRAM flag) is then placed by the host in that pool and mapped by the KMD; without
+        //    it such shmems must be GUEST_VRAM blobs too.
+        //  - Shared/presentable (RESOURCE_TYPE_SHARED) and imported (RESOURCE_TYPE_IMPORT) host
+        //    textures need nothing from the guest: the host owns their memory, the KMD attaches no
+        //    backing and SET_SCANOUT_BLOB scans them out by res_id.
+        UINT HasVenusPool : 1;
+        UINT Reserved : 27;
     } Flags;
     ULONGLONG SupportedCapsetIDs;
     LUID AdapterLuid;

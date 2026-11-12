@@ -1015,13 +1015,15 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 // from the host-visible BAR region normally, from the shared pools in a protected VM.
                 info->Flags.HasShmem = m_VioDev.shmem.available || m_PoolMode;
                 info->Flags.GuestVram = m_PoolMode ? 1 : 0;
+                info->Flags.HasVenusPool = HasVenusPool() ? 1 : 0;
                 // Wire selection: the UMD picks the BY_ID blob map/unmap wire
                 // from this.  Always set, but it stays a flag because the
                 // struct is UMD-facing ABI.
                 info->Flags.Wddm2 = 1;
                 info->Flags.Reserved = 0;
-                VioGpuRegLog("pool: adapterinfo HasShmem=%u GuestVram=%u\n", (UINT)info->Flags.HasShmem,
-                             (UINT)info->Flags.GuestVram);
+                VioGpuRegLog("pool: adapterinfo HasShmem=%u GuestVram=%u HasVenusPool=%u\n",
+                             (UINT)info->Flags.HasShmem, (UINT)info->Flags.GuestVram,
+                             (UINT)info->Flags.HasVenusPool);
                 info->SupportedCapsetIDs = m_supportedCapsetIDs;
                 info->AdapterLuid = m_AdapterLuid;
                 return STATUS_SUCCESS;
