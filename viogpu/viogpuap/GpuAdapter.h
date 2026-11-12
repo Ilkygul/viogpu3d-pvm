@@ -90,6 +90,7 @@ class GpuAdapter
     HANDLE m_hThread;
     HANDLE m_hStopEvent;
     HANDLE m_hResolutionEvent;
+    bool m_RetryApply; /* last apply failed (e.g. lock/logon screen): retry on a timer */
     HDC m_hDC;
     D3DKMT_HANDLE m_hAdapter;
     ULONG m_Index;

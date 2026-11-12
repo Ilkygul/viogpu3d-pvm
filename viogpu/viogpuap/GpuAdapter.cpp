@@ -30,7 +30,7 @@
 #include "pch.h"
 
 GpuAdapter::GpuAdapter(const std::wstring LinkName)
-    : m_hThread(NULL), m_hStopEvent(NULL), m_hResolutionEvent(NULL), m_hDC(NULL), m_hAdapter(NULL), m_Index(-1),
+    : m_hThread(NULL), m_hStopEvent(NULL), m_hResolutionEvent(NULL), m_RetryApply(false), m_hDC(NULL), m_hAdapter(NULL), m_Index(-1),
       m_PathArrayElements(0), m_ModeInfoArrayElements(0), m_pDisplayPathInfo(NULL), m_pDisplayModeInfo(NULL),
       m_Flag(None)
 {
@@ -316,14 +316,20 @@ bool GpuAdapter::SyncResolution(void)
         {
             PrintMessage(L"%ws resolution unchanged (%dx%d), skipping apply\n", __FUNCTIONW__, custom.XResolution,
                          custom.YResolution);
+            m_RetryApply = false;
             return false;
         }
         PrintMessage(L"%ws host %dx%d, current %dx%d: applying\n", __FUNCTIONW__, custom.XResolution,
                      custom.YResolution, current.XResolution, current.YResolution);
         if (!SetResolution(&custom))
         {
+            /* SetDisplayConfig fails with ERROR_ACCESS_DENIED while the logon or lock screen owns the
+             * input desktop (right after boot). Nothing pulses the resolution event once the user's
+             * desktop appears, so keep retrying on a timer until an apply succeeds. */
+            m_RetryApply = true;
             return false;
         }
+        m_RetryApply = false;
         UpdateDisplayConfig(); /* paths and modes after the mode change */
         /* A display-only driver gets dirty rects only; after a mode change parts of the new
          * framebuffer would keep old content until something redraws them. Ask everything to repaint,
@@ -360,9 +366,14 @@ void GpuAdapter::Run()
         const HANDLE handles[] = {m_hStopEvent, m_hResolutionEvent};
         while (1)
         {
-            if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0)
+            DWORD wr = WaitForMultipleObjects(2, handles, FALSE, m_RetryApply ? 2000 : INFINITE);
+            if (wr == WAIT_OBJECT_0)
             {
                 break;
+            }
+            if (wr == WAIT_TIMEOUT)
+            {
+                PrintMessage(L"%ws retrying a failed apply\n", __FUNCTIONW__);
             }
             SyncAndConfirm();
         }
