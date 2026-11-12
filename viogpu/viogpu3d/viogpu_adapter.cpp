@@ -3991,8 +3991,20 @@ static VOID FindDrvmPools(ULONGLONG *guestBase, ULONGLONG *guestSize, ULONGLONG 
     {
         ULONG len = 0;
         RtlZeroMemory(buf, sizeof(buf));
-        if (NT_SUCCESS(IoGetDeviceProperty(devs[i], DevicePropertyHardwareID, sizeof(buf) - sizeof(WCHAR), buf, &len)) &&
-            wcsstr(buf, L"DRVM0001") != NULL)
+        BOOLEAN isPool = FALSE;
+        if (NT_SUCCESS(IoGetDeviceProperty(devs[i], DevicePropertyHardwareID, sizeof(buf) - 2 * sizeof(WCHAR), buf, &len)))
+        {
+            /* REG_MULTI_SZ: ACPI\VEN_DRVM&DEV_0001, ACPI\DRVM0001, *DRVM0001 -- look at every string */
+            for (PWCHAR id = buf; *id != L'\0' && id < buf + RTL_NUMBER_OF(buf); id += wcslen(id) + 1)
+            {
+                if (wcsstr(id, L"DRVM0001") != NULL || wcsstr(id, L"VEN_DRVM&DEV_0001") != NULL)
+                {
+                    isPool = TRUE;
+                    break;
+                }
+            }
+        }
+        if (isPool)
         {
             WCHAR inst[128] = {0};
             DEVPROPTYPE type = 0;
