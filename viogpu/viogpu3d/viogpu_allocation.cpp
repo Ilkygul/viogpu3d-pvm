@@ -1173,24 +1173,43 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
     // Only element [0] is ever filled in below, so a multi-allocation create
     // would hand dxgkrnl uninitialised hAllocation values to destroy later.
     // The paired UMD always asks for exactly one.
+    // Registry-log trace of every create that carries a UMD private-data block (the first 64 of them,
+    // and every SHARED one): a shared-texture create that fails in the UMD with E_INVALIDARG but leaves
+    // no "createalloc:" line here was rejected by dxgkrnl before reaching this driver.
+    static volatile LONG s_createLogs = 0;
+    const BOOLEAN logCreate = InterlockedIncrement(&s_createLogs) <= 64;
+
     if (pCreateAllocation->NumAllocations != 1)
     {
-        DbgPrint(TRACE_LEVEL_ERROR,
-                 ("<--- %s unsupported NumAllocations %d\n", __FUNCTION__, pCreateAllocation->NumAllocations));
+        VioGpuRegLog("createalloc: REJECT STATUS_INVALID_PARAMETER NumAllocations=%u (need 1) flags=0x%x\n",
+                     pCreateAllocation->NumAllocations, pCreateAllocation->Flags.Value);
         return STATUS_INVALID_PARAMETER;
     }
 
     DXGK_ALLOCATIONINFO *allocationInfo = pCreateAllocation->pAllocationInfo;
+    {
+        const ULONG peekType =
+            (allocationInfo->pPrivateDriverData != NULL &&
+             allocationInfo->PrivateDriverDataSize >= sizeof(ULONG))
+                ? *(ULONG *)allocationInfo->pPrivateDriverData
+                : 0xffffffffu;
+        if (logCreate || peekType == VIOGPU_RESOURCE_TYPE_SHARED)
+        {
+            VioGpuRegLog("createalloc: enter type=%u flags=0x%x resource=%u hResource=%p allocPriv=%u resPriv=%u pool=%u\n",
+                         peekType, pCreateAllocation->Flags.Value, (UINT)pCreateAllocation->Flags.Resource,
+                         pCreateAllocation->hResource, allocationInfo->PrivateDriverDataSize,
+                         pCreateAllocation->PrivateDriverDataSize, (UINT)adapter->PoolMode());
+        }
+    }
 
 
     if (max(allocationInfo->PrivateDriverDataSize, pCreateAllocation->PrivateDriverDataSize) <
         sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE))
     {
-        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s private driver data is too small (%d and %d < %zu)\n",
-                                     __FUNCTION__,
-                                     allocationInfo->PrivateDriverDataSize,
-                                     pCreateAllocation->PrivateDriverDataSize,
-                                     sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE)));
+        VioGpuRegLog("createalloc: REJECT STATUS_INVALID_PARAMETER private data too small (alloc %u, resource %u < %zu)\n",
+                     allocationInfo->PrivateDriverDataSize,
+                     pCreateAllocation->PrivateDriverDataSize,
+                     sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE));
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1221,13 +1240,14 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             allocation = new (NonPagedPoolNx) VioGpuAllocation(adapter, &resourceExchange->OptionsShared, resourceExchange->Size);
             break;
         default:
-            DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s invalid resource type %d\n", __FUNCTION__, resourceExchange->Type));
+            VioGpuRegLog("createalloc: REJECT STATUS_INVALID_PARAMETER invalid resource type %u\n",
+                         resourceExchange->Type);
             return STATUS_INVALID_PARAMETER;
     }
 
     if (allocation == NULL)
     {
-        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s failed to allocate VioGpuAllocation\n", __FUNCTION__));
+        VioGpuRegLog("createalloc: REJECT STATUS_NO_MEMORY type=%u (VioGpuAllocation)\n", resourceExchange->Type);
         return STATUS_NO_MEMORY;
     }
 
@@ -1433,7 +1453,12 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             // write-back backing for the same reason as the coherent 3D case
             // above.  Cached is not permitted on a primary surface, so
             // scanout primaries keep the write-combined default.
-            if (!resourceExchange->OptionsShared.primary)
+            // Pool mode: the segment is a CPU-visible, cache-coherent LOCAL (non-aperture) segment over
+            // shared pool memory.  Cached selects write-back for system-memory (aperture) backing; asking
+            // for it on an allocation whose only segment is a non-aperture one is a combination the video
+            // memory manager may refuse (the same class of rejection as the AccessedPhysically/
+            // ExplicitResidencyNotification case in the BLOB branch), so leave the flag clear there.
+            if (!resourceExchange->OptionsShared.primary && !adapter->PoolMode())
             {
                 allocationInfo->Flags.Cached = TRUE;
             }
@@ -1450,6 +1475,14 @@ NTSTATUS VioGpuAllocation::DxgkCreateAllocation(VioGpuAdapter *adapter, DXGKARG_
             break;
     }
 
+    if (logCreate || resourceExchange->Type == VIOGPU_RESOURCE_TYPE_SHARED)
+    {
+        VioGpuRegLog("createalloc: ok type=%u res_id=%u size=%I64u flags=0x%x prefSeg=%u evict=0x%x rd=0x%x wr=0x%x\n",
+                     resourceExchange->Type, allocation->GetId(), (ULONGLONG)allocationInfo->Size,
+                     allocationInfo->Flags.Value, (UINT)allocationInfo->PreferredSegment.SegmentId0,
+                     (UINT)allocationInfo->EvictionSegmentSet, (UINT)allocationInfo->SupportedReadSegmentSet,
+                     (UINT)allocationInfo->SupportedWriteSegmentSet);
+    }
     return STATUS_SUCCESS;
 }
 
