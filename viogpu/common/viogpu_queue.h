@@ -290,6 +290,14 @@ class VioGpuQueue
     VioGpuBuf *m_pBuf;
 };
 
+// Why ResourceMapBlobSync failed (see its failKind parameter).
+#define VIOGPU_MAPFAIL_NONE    0
+#define VIOGPU_MAPFAIL_NOBUF   1 // no command buffer / wait context to issue it with
+#define VIOGPU_MAPFAIL_QUEUE   2 // the control queue refused the command
+#define VIOGPU_MAPFAIL_TIMEOUT 3 // the host did not answer within the wait
+#define VIOGPU_MAPFAIL_NORESP  4 // completed without a host response (command never delivered)
+#define VIOGPU_MAPFAIL_HOST    5 // the host answered an error (hostResp)
+
 class CtrlQueue : public VioGpuQueue
 {
   public:
@@ -353,7 +361,10 @@ class CtrlQueue : public VioGpuQueue
     BOOLEAN ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx);
     // mapInfo/poolOffset (optional) return the host's answer: with VIRTIO_GPU_MAP_INFO_POOL in
     // *mapInfo the blob is resident in the pre-shared venus pool at byte *poolOffset.
-    BOOLEAN ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo = NULL, ULONG *poolOffset = NULL);
+    // failKind (VIOGPU_MAPFAIL_*) and hostResp (the host's response type, 0 if none arrived) say WHY a
+    // FALSE return failed, so the caller can retry what is transient and report what is not.
+    BOOLEAN ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo = NULL, ULONG *poolOffset = NULL,
+                                ULONG *failKind = NULL, ULONG *hostResp = NULL);
     BOOLEAN ResourceUnmapBlobSync(UINT res_id, UINT ctx_id);
 
     BOOLEAN GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres);

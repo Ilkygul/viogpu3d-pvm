@@ -43,30 +43,51 @@ void GpuAdapter::UpdateDisplayConfig(void)
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
-    UINT32 filter = QDC_ALL_PATHS;
     ClearDisplayConfig();
 
-    if (FAILED(HRESULT_FROM_WIN32(::GetDisplayConfigBufferSizes(filter,
-                                                                &m_PathArrayElements,
-                                                                &m_ModeInfoArrayElements))))
+    /* All paths first (the upstream behaviour), active paths if that fails: with a display-less
+     * Basic Display adapter next to ours, QDC_ALL_PATHS failed after every boot and the zeroed
+     * arrays made every resize land on an inactive path. ERROR_INSUFFICIENT_BUFFER means the
+     * topology changed between the two calls: ask for the sizes again. */
+    LONG rc = ERROR_GEN_FAILURE;
+    const UINT32 filters[] = {QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS};
+    for (UINT32 filter : filters)
     {
-        PrintMessage(L"GetDisplayConfigBufferSizes faled\n");
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            ClearDisplayConfig();
+            rc = ::GetDisplayConfigBufferSizes(filter, &m_PathArrayElements, &m_ModeInfoArrayElements);
+            if (rc != ERROR_SUCCESS)
+            {
+                break;
+            }
+            m_pDisplayPathInfo = new DISPLAYCONFIG_PATH_INFO[m_PathArrayElements];
+            m_pDisplayModeInfo = new DISPLAYCONFIG_MODE_INFO[m_ModeInfoArrayElements];
+            ZeroMemory(m_pDisplayPathInfo, sizeof(DISPLAYCONFIG_PATH_INFO) * m_PathArrayElements);
+            ZeroMemory(m_pDisplayModeInfo, sizeof(DISPLAYCONFIG_MODE_INFO) * m_ModeInfoArrayElements);
+            rc = ::QueryDisplayConfig(filter, &m_PathArrayElements, m_pDisplayPathInfo, &m_ModeInfoArrayElements,
+                                      m_pDisplayModeInfo, NULL);
+            if (rc != ERROR_INSUFFICIENT_BUFFER)
+            {
+                break;
+            }
+        }
+        PrintMessage(L"%ws QueryDisplayConfig(0x%x) rc=%ld paths=%u modes=%u\n", __FUNCTIONW__, filter, rc,
+                     m_PathArrayElements, m_ModeInfoArrayElements);
+        if (rc == ERROR_SUCCESS)
+        {
+            break;
+        }
+    }
+    if (rc != ERROR_SUCCESS)
+    {
+        ClearDisplayConfig();
         return;
     }
-
-    m_pDisplayPathInfo = new DISPLAYCONFIG_PATH_INFO[m_PathArrayElements];
-    m_pDisplayModeInfo = new DISPLAYCONFIG_MODE_INFO[m_ModeInfoArrayElements];
-    ZeroMemory(m_pDisplayPathInfo, sizeof(DISPLAYCONFIG_PATH_INFO) * m_PathArrayElements);
-    ZeroMemory(m_pDisplayModeInfo, sizeof(DISPLAYCONFIG_MODE_INFO) * m_ModeInfoArrayElements);
-
-    if (SUCCEEDED(HRESULT_FROM_WIN32(::QueryDisplayConfig(filter,
-                                                          &m_PathArrayElements,
-                                                          m_pDisplayPathInfo,
-                                                          &m_ModeInfoArrayElements,
-                                                          m_pDisplayModeInfo,
-                                                          NULL))))
     {
-
+        /* QDC_ALL_PATHS also lists the inactive paths, with the same source (GDI) name: take the
+         * active path of our source, and the first named one only when none is active. */
+        int firstMatch = -1;
         for (UINT PathIdx = 0; PathIdx < GetNumbersOfPathArrayElements(); ++PathIdx)
         {
             DISPLAYCONFIG_SOURCE_DEVICE_NAME SourceName = {};
@@ -75,14 +96,30 @@ void GpuAdapter::UpdateDisplayConfig(void)
             SourceName.header.adapterId = m_pDisplayPathInfo[PathIdx].sourceInfo.adapterId;
             SourceName.header.id = m_pDisplayPathInfo[PathIdx].sourceInfo.id;
 
-            if (SUCCEEDED(HRESULT_FROM_WIN32(::DisplayConfigGetDeviceInfo(&SourceName.header))))
+            LONG gi = ::DisplayConfigGetDeviceInfo(&SourceName.header);
+            PrintMessage(L"%ws path %u src %u gdi=%ws flags=0x%x want=%ws rc=%ld\n", __FUNCTIONW__, PathIdx,
+                         m_pDisplayPathInfo[PathIdx].sourceInfo.id, gi == ERROR_SUCCESS ? SourceName.viewGdiDeviceName : L"?",
+                         m_pDisplayPathInfo[PathIdx].flags, m_DeviceName.c_str(), gi);
+            if (SUCCEEDED(HRESULT_FROM_WIN32(gi)))
             {
                 if (wcscmp(m_DeviceName.c_str(), SourceName.viewGdiDeviceName) == 0)
                 {
-                    m_Index = PathIdx;
-                    break;
+                    if (firstMatch < 0)
+                    {
+                        firstMatch = (int)PathIdx;
+                    }
+                    if (m_pDisplayPathInfo[PathIdx].flags & DISPLAYCONFIG_PATH_ACTIVE)
+                    {
+                        m_Index = PathIdx;
+                        firstMatch = -2; /* found an active one */
+                        break;
+                    }
                 }
             }
+        }
+        if (firstMatch >= 0)
+        {
+            m_Index = (UINT)firstMatch;
         }
     }
 };
@@ -238,10 +275,9 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
 
     if (m_pDisplayPathInfo == NULL || m_pDisplayModeInfo == NULL || m_Index >= GetNumbersOfPathArrayElements())
     {
-        PrintMessage(L"%ws no display config for m_Index %d\n", __FUNCTIONW__, m_Index);
+        PrintMessage(L"%ws no display path\n", __FUNCTIONW__);
         return false;
     }
-
     // An inactive path carries DISPLAYCONFIG_PATH_MODE_IDX_INVALID, which would
     // index the mode info array out of bounds.
     UINT ix = m_pDisplayPathInfo[m_Index].sourceInfo.modeInfoIdx;
@@ -250,16 +286,67 @@ bool GpuAdapter::SetResolution(PVIOGPU_DISP_MODE mode)
         PrintMessage(L"%ws m_Index %d has no mode info (idx %d)\n", __FUNCTIONW__, m_Index, ix);
         return false;
     }
-
     PrintMessage(L"%ws m_Index %d %d (%dx%d)\n", __FUNCTIONW__, m_Index, ix, mode->XResolution, mode->YResolution);
     m_pDisplayModeInfo[ix].sourceMode.width = mode->XResolution;
     m_pDisplayModeInfo[ix].sourceMode.height = mode->YResolution;
-    SetDisplayConfig(m_PathArrayElements,
-                     m_pDisplayPathInfo,
-                     m_ModeInfoArrayElements,
-                     m_pDisplayModeInfo,
-                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-    return true;
+    LONG rc = SetDisplayConfig(m_PathArrayElements,
+                               m_pDisplayPathInfo,
+                               m_ModeInfoArrayElements,
+                               m_pDisplayModeInfo,
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    PrintMessage(L"%ws SetDisplayConfig rc=%ld\n", __FUNCTIONW__, rc);
+    return rc == ERROR_SUCCESS;
+}
+
+bool GpuAdapter::SyncResolution(void)
+{
+    PrintMessage(L"%ws\n", __FUNCTIONW__);
+
+    VIOGPU_DISP_MODE custom = {0};
+    UpdateDisplayConfig();
+    if (GetCustomResolution(&custom))
+    {
+        VIOGPU_DISP_MODE current = {0};
+        // The resolution event fires for every host display event, not only for
+        // actual mode changes.  SetDisplayConfig with SDC_APPLY forces a modeset
+        // (screen blank + DWM swapchain rebuild) even when the supplied mode equals
+        // the current one, so skip no-op applies.
+        if (GetCurrentResolution(&current) && current.XResolution == custom.XResolution &&
+            current.YResolution == custom.YResolution)
+        {
+            PrintMessage(L"%ws resolution unchanged (%dx%d), skipping apply\n", __FUNCTIONW__, custom.XResolution,
+                         custom.YResolution);
+            return false;
+        }
+        PrintMessage(L"%ws host %dx%d, current %dx%d: applying\n", __FUNCTIONW__, custom.XResolution,
+                     custom.YResolution, current.XResolution, current.YResolution);
+        if (!SetResolution(&custom))
+        {
+            return false;
+        }
+        UpdateDisplayConfig(); /* paths and modes after the mode change */
+        /* A display-only driver gets dirty rects only; after a mode change parts of the new
+         * framebuffer would keep old content until something redraws them. Ask everything to repaint,
+         * once right away and once after Explorer has relaid out. */
+        for (DWORD delay : {700, 2500})
+        {
+            Sleep(delay);
+            RedrawWindow(NULL, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        return true;
+    }
+    return false;
+}
+
+// The KMD pulses the resolution event, so a host resize that arrives while an
+// earlier one is still being applied (the repaint sleeps) would be missed.
+// After every apply look again: a second pass finds the size unchanged and
+// stops, a size that moved in the meantime is applied too.
+void GpuAdapter::SyncAndConfirm(void)
+{
+    for (int pass = 0; pass < 4 && SyncResolution(); pass++)
+    {
+    }
 }
 
 void GpuAdapter::Run()
@@ -268,6 +355,8 @@ void GpuAdapter::Run()
 
     if (m_hThread != NULL && m_hStopEvent != NULL && m_hResolutionEvent != NULL)
     {
+        SyncAndConfirm();
+
         const HANDLE handles[] = {m_hStopEvent, m_hResolutionEvent};
         while (1)
         {
@@ -275,28 +364,7 @@ void GpuAdapter::Run()
             {
                 break;
             }
-            VIOGPU_DISP_MODE custom = {0};
-            UpdateDisplayConfig();
-            if (GetCustomResolution(&custom))
-            {
-                VIOGPU_DISP_MODE current = {0};
-                // The resolution event fires for every host display event, not only
-                // for actual mode changes.  SetDisplayConfig with SDC_APPLY forces a
-                // modeset (screen blank + DWM swapchain rebuild) even when the
-                // supplied mode equals the current one, so skip no-op applies.
-                if (GetCurrentResolution(&current) && current.XResolution == custom.XResolution &&
-                    current.YResolution == custom.YResolution)
-                {
-                    PrintMessage(L"%ws resolution unchanged (%dx%d), skipping apply\n",
-                                 __FUNCTIONW__,
-                                 custom.XResolution,
-                                 custom.YResolution);
-                }
-                else
-                {
-                    SetResolution(&custom);
-                }
-            }
+            SyncAndConfirm();
         }
     }
 }

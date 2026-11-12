@@ -466,6 +466,12 @@ VioGpuAllocation::~VioGpuAllocation(void)
         m_Blob.Mapped = FALSE;
         m_HostPoolMap = FALSE;
     }
+    if (m_PoolAccounted)
+    {
+        // The RESOURCE_UNREF queued below hands the pool block back to the host.
+        m_PoolAccounted = FALSE;
+        m_adapter->VenusPoolAccount(-(LONGLONG)m_Size);
+    }
 
     if (m_IsImport)
     {
@@ -863,11 +869,84 @@ BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
     {
         // Protected VM: the host sub-allocates the blob from the pre-shared VENUS_HOST pool and
         // answers with the pool byte offset.  A BAR window is useless here.
-        ULONG mapInfo = 0, poolOffset = 0;
-        if (!m_adapter->ctrlQueue.ResourceMapBlobSync(m_Id, ctxId, 0, &mapInfo, &poolOffset))
+        //
+        // Transient failures are retried here, with a bounded budget, instead of failing the UMD's
+        // RES_INFO (and with it the shmem create):
+        //  - NOBUF/QUEUE/NORESP: the command never reached the host (no vbuf, ring or staging
+        //    space); sending it again is safe, nothing was mapped.
+        //  - HOST out-of-memory: the pool is full *now*; blobs destroyed a moment ago are only
+        //    returned by the host when their RESOURCE_UNREF is processed, so waiting can help.
+        // Not retried: a timeout (already 10 s), and any other host error (permanent).
+        ULONG mapInfo = 0, poolOffset = 0, failKind = VIOGPU_MAPFAIL_NONE, hostResp = 0;
+        const ULONGLONG t0 = KeQueryInterruptTime();
+        const ULONGLONG budget = 3000ULL * 10000ULL; // 3 s in 100 ns units
+        ULONG attempt = 0;
+        BOOLEAN mapped;
+        for (;;)
         {
-            DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d pool map failed\n", __FUNCTION__, m_Id));
+            mapped = m_adapter->ctrlQueue.ResourceMapBlobSync(m_Id, ctxId, 0, &mapInfo, &poolOffset, &failKind, &hostResp);
+            if (mapped)
+            {
+                break;
+            }
+            const BOOLEAN poolFull = (failKind == VIOGPU_MAPFAIL_HOST && hostResp == VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
+            const BOOLEAN transient = failKind == VIOGPU_MAPFAIL_NOBUF || failKind == VIOGPU_MAPFAIL_QUEUE ||
+                                      failKind == VIOGPU_MAPFAIL_NORESP || poolFull;
+            if (!transient || KeQueryInterruptTime() - t0 >= budget)
+            {
+                break;
+            }
+            LARGE_INTEGER delay;
+            delay.QuadPart = -(LONGLONG)(min(250UL, 1UL << min(attempt, 8UL))) * 10000LL; // 1..250 ms
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            attempt++;
+        }
+        if (!mapped)
+        {
+            const ULONGLONG poolSize = m_adapter->VenusPoolSize();
+            const ULONGLONG poolUsed = m_adapter->VenusPoolUsed();
+            const char *why;
+            switch (failKind)
+            {
+                case VIOGPU_MAPFAIL_NOBUF:
+                    why = "no command buffer";
+                    m_MapStatus = STATUS_DEVICE_NOT_READY;
+                    break;
+                case VIOGPU_MAPFAIL_QUEUE:
+                    why = "control queue refused the command";
+                    m_MapStatus = STATUS_DEVICE_NOT_READY;
+                    break;
+                case VIOGPU_MAPFAIL_NORESP:
+                    why = "map-response never arrived (command not delivered)";
+                    m_MapStatus = STATUS_DEVICE_NOT_READY;
+                    break;
+                case VIOGPU_MAPFAIL_TIMEOUT:
+                    why = "host did not answer within 10 s";
+                    m_MapStatus = STATUS_IO_TIMEOUT;
+                    break;
+                default:
+                    if (hostResp == VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY)
+                    {
+                        why = "venus pool full (host out of memory)";
+                        m_MapStatus = STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                    else
+                    {
+                        why = "host rejected the map";
+                        m_MapStatus = STATUS_DEVICE_PROTOCOL_ERROR;
+                    }
+                    break;
+            }
+            DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d pool map failed: %s\n", __FUNCTION__, m_Id, why));
+            VioGpuRegLog("venuspool: res_id=%u size=%I64u map FAILED: %s kind=%u host_resp=0x%x retries=%u "
+                         "pool used=%I64u of %I64u bytes in %d blobs -> status 0x%x\n",
+                         m_Id, m_Size, why, failKind, hostResp, attempt, poolUsed, poolSize,
+                         m_adapter->VenusPoolBlobs(), m_MapStatus);
             return FALSE;
+        }
+        if (attempt != 0)
+        {
+            VioGpuRegLog("venuspool: res_id=%u map succeeded after %u retries\n", m_Id, attempt);
         }
         if (!(mapInfo & VIRTIO_GPU_MAP_INFO_POOL) ||
             (ULONGLONG)poolOffset + m_Size > m_adapter->VenusPoolSize() || !m_adapter->HasVenusPool())
@@ -879,11 +958,18 @@ BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
                          m_Id, mapInfo, poolOffset, m_Size);
             // leave it mapped host-side; it is torn down with the resource
             m_Blob.Mapped = TRUE;
+            m_MapStatus = STATUS_DEVICE_PROTOCOL_ERROR;
             return FALSE;
         }
         m_PoolPa = m_adapter->VenusPoolBase() + poolOffset;
         m_Blob.Mapped = TRUE;
         m_HostPoolMap = TRUE;
+        m_MapStatus = STATUS_SUCCESS;
+        if (!m_PoolAccounted)
+        {
+            m_PoolAccounted = TRUE;
+            m_adapter->VenusPoolAccount((LONGLONG)m_Size);
+        }
         VioGpuRegLog("venuspool: res_id=%u map_info=0x%x pool_offset=0x%x -> pa %I64x size=%I64u\n",
                      m_Id, mapInfo, poolOffset, m_PoolPa, m_Size);
         return TRUE;
@@ -893,6 +979,7 @@ BOOLEAN VioGpuAllocation::MapBlobSyncLocked(VioGpuDevice *pDevice)
         // Nothing is mapped host-side; leaving Mapped clear keeps the
         // paired unmap from believing there is a mapping to tear down.
         DbgPrint(TRACE_LEVEL_ERROR, ("%s res_id=%d sync map failed\n", __FUNCTION__, m_Id));
+        m_MapStatus = STATUS_DEVICE_NOT_READY;
         return FALSE;
     }
     m_Blob.Mapped = TRUE;
@@ -1770,8 +1857,9 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
             if (!m_Blob.Mapped && pMapDevice != NULL && !MapBlobSyncLocked(pMapDevice))
             {
                 DbgPrint(TRACE_LEVEL_ERROR,
-                         ("%s res_id=%d host pool map failed -- failing RES_INFO\n", __FUNCTION__, m_Id));
-                return STATUS_DEVICE_NOT_READY;
+                         ("%s res_id=%d host pool map failed -- failing RES_INFO (0x%x)\n", __FUNCTION__, m_Id,
+                          m_MapStatus));
+                return m_MapStatus != STATUS_SUCCESS ? m_MapStatus : STATUS_DEVICE_NOT_READY;
             }
             winPa = m_PoolPa;
             if (winPa == 0 && pMapDevice == NULL)
@@ -1841,7 +1929,7 @@ NTSTATUS VioGpuAllocation::EscapeResourceInfo(VIOGPU_RES_INFO_REQ *resInfo, VioG
             // The UMD would otherwise write into an unbacked BAR window.
             DbgPrint(TRACE_LEVEL_ERROR,
                      ("%s res_id=%d host map failed -- failing RES_INFO\n", __FUNCTION__, m_Id));
-            return STATUS_DEVICE_NOT_READY;
+            return m_MapStatus != STATUS_SUCCESS ? m_MapStatus : STATUS_DEVICE_NOT_READY;
         }
     }
     else

@@ -1210,17 +1210,31 @@ BOOLEAN CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, v
 // RES_INFO placement escape) need the acknowledgement.  Because the control
 // queue is FIFO, the response also proves the resource's CREATE_BLOB was
 // processed, so a ring command may name the res_id as soon as this returns.
-BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo, ULONG *poolOffset)
+BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *mapInfo, ULONG *poolOffset,
+                                       ULONG *failKind, ULONG *hostResp)
 {
     PAGED_CODE();
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d offset=%llx\n", __FUNCTION__, res_id, offset));
+
+    if (failKind)
+    {
+        *failKind = VIOGPU_MAPFAIL_NONE;
+    }
+    if (hostResp)
+    {
+        *hostResp = 0;
+    }
 
     PGPU_RES_MAP_BLOB cmd;
     PGPU_VBUFFER vbuf;
     cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), NULL, sizeof(GPU_RESP_MAP_INFO));
     if (!cmd)
     {
+        if (failKind)
+        {
+            *failKind = VIOGPU_MAPFAIL_NOBUF;
+        }
         return FALSE;
     }
     RtlZeroMemory(cmd, sizeof(*cmd));
@@ -1236,6 +1250,10 @@ BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offse
     if (!waitCtx)
     {
         ReleaseBuffer(vbuf);
+        if (failKind)
+        {
+            *failKind = VIOGPU_MAPFAIL_NOBUF;
+        }
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
@@ -1249,6 +1267,10 @@ BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offse
         // Never reached the host; the callback already fired.
         VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
         ReleaseBuffer(vbuf);
+        if (failKind)
+        {
+            *failKind = VIOGPU_MAPFAIL_QUEUE;
+        }
         return FALSE;
     }
 
@@ -1259,19 +1281,35 @@ BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offse
     {
         DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
         VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        if (failKind)
+        {
+            *failKind = VIOGPU_MAPFAIL_TIMEOUT;
+        }
         return FALSE;
     }
     VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
 
     // A host that answered but refused the map (bad offset, out of memory)
     // left the window unbacked; success here is what lets the caller latch
-    // Mapped and hand the window out.
+    // Mapped and hand the window out.  A response type of 0 means the
+    // completion fired without the host writing a response: QueueBuffer
+    // completes a command locally when it cannot stage or post it, and that
+    // must not be mistaken for a successful map.
     PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
-    bool error = resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC;
+    const ULONG respType = resp->type;
+    if (hostResp)
+    {
+        *hostResp = respType;
+    }
+    bool error = respType >= VIRTIO_GPU_RESP_ERR_UNSPEC || respType == 0;
     if (error)
     {
         DbgPrint(TRACE_LEVEL_ERROR,
-                 ("---> %s host rejected map res_id=%u resp=0x%x\n", __FUNCTION__, res_id, resp->type));
+                 ("---> %s host rejected map res_id=%u resp=0x%x\n", __FUNCTION__, res_id, respType));
+        if (failKind)
+        {
+            *failKind = respType == 0 ? VIOGPU_MAPFAIL_NORESP : VIOGPU_MAPFAIL_HOST;
+        }
     }
     else
     {

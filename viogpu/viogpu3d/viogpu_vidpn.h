@@ -74,6 +74,7 @@ class VioGpuVidPN
     PBYTE GetCTA861Data(void);
     void SetVideoModeInfo(UINT Idx, PVIOGPU_DISP_MODE pModeInfo);
     BOOLEAN GetDisplayInfo(void);
+    void RefreshEdid(void);
     int ProcessEdid(void);
     void FixEdid(void);
     void ClearEdidImageSize(void);

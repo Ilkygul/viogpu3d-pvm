@@ -56,11 +56,13 @@ BOOL GpuAdaptersMgr::FindDisplayDevice(PDISPLAY_DEVICE lpDisplayDevice, std::wst
 {
     PrintMessage(L"%ws\n", __FUNCTIONW__);
 
-    DWORD index = *adapterIndex;
-    (*adapterIndex)++;
-
-    if (GetDisplayDevice(NULL, index, lpDisplayDevice, 0))
+    /* Walk every display device: the VirtIO GPU is not necessarily device 0 (with a
+     * simplefb/Basic Display adapter next to it, it is not). Stop only when enumeration ends. */
+    while (GetDisplayDevice(NULL, *adapterIndex, lpDisplayDevice, 0))
     {
+        (*adapterIndex)++;
+        PrintMessage(L"%ws device %ws id %ws flags 0x%x\n", __FUNCTIONW__, lpDisplayDevice->DeviceName,
+                     lpDisplayDevice->DeviceID, lpDisplayDevice->StateFlags);
         if (!name.empty() && !_wcsnicmp(lpDisplayDevice->DeviceID, name.c_str(), name.size()))
         {
             return TRUE;

@@ -231,6 +231,12 @@ class VioGpuAllocation final : public HandleBase<"VIOGALLO"_M, VioGpuAllocation>
     // VENUS_HOST pool and there is no host mapping to tear down (crosvm's UNMAP_BLOB only drops its
     // pool_offset record, and answers ErrUnspec when asked twice or for a blob it never mapped).
     BOOL m_HostPoolMap = FALSE;
+    // The pool window is counted in the adapter's venus-pool usage (released when the resource is destroyed,
+    // which is when the host takes the pool block back).
+    BOOL m_PoolAccounted = FALSE;
+    // Why the last MapBlobSyncLocked failed; EscapeResourceInfo returns it so the UMD can tell a full pool
+    // from a host that did not answer.
+    NTSTATUS m_MapStatus = STATUS_SUCCESS;
     UINT m_SharedWidth;
     UINT m_SharedHeight;
     UINT m_SharedFormat; // DXGI_FORMAT

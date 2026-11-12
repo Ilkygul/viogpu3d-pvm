@@ -3570,7 +3570,7 @@ BOOLEAN FindUpdateRect(_In_ ULONG NumMoves,
     return updated;
 }
 
-NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
+NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect, BOOLEAN force)
 {
     PAGED_CODE();
     NTSTATUS Status(STATUS_SUCCESS);
@@ -3579,8 +3579,11 @@ NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
 
     // Dedupe against the cached state: DXGK only needs to see actual
     // transitions, and the cache also gates the hotplug-disconnect
-    // direction.
-    if (!!m_scanoutConnected[0] == !!connect)
+    // direction.  A display event that changed the host size passes force:
+    // re-indicating "connected" is what makes dxgkrnl query the child again
+    // (monitor descriptor, RecommendMonitorModes) and pick up the new mode,
+    // as viogpudo does on every config change.
+    if (!force && !!m_scanoutConnected[0] == !!connect)
     {
         return STATUS_SUCCESS;
     }
@@ -3592,6 +3595,8 @@ NTSTATUS VioGpuAdapter::UpdateChildStatus(BOOLEAN connect)
     ChildStatus.ChildUid = 0;
     ChildStatus.HotPlug.Connected = connect;
     Status = pDXGKInterface->DxgkCbIndicateChildStatus(pDXGKInterface->DeviceHandle, &ChildStatus);
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s: DxgkCbIndicateChildStatus(connected=%d force=%d) -> 0x%x\n", __FUNCTION__, connect, force, Status));
     if (Status != STATUS_SUCCESS)
     {
         DbgPrint(TRACE_LEVEL_ERROR,
@@ -3695,25 +3700,31 @@ void VioGpuAdapter::ConfigChanged(void)
     DbgPrint(TRACE_LEVEL_FATAL, ("<--> %s\n", __FUNCTION__));
     UINT32 events_read, events_clear = 0;
     virtio_get_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_read), &events_read, sizeof(events_read));
+    DbgPrint(TRACE_LEVEL_FATAL, ("%s: events_read 0x%x\n", __FUNCTION__, events_read));
     if (events_read & VIRTIO_GPU_EVENT_DISPLAY)
     {
-        vidpn.GetDisplayInfo();
-        vidpn.AddCustomMonitorMode(0);
         events_clear |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_set_config(&m_VioDev, FIELD_OFFSET(GPU_CONFIG, events_clear), &events_clear, sizeof(events_clear));
 
-        // Probe per-scanout enable state and emit child-status
-        // transitions in both directions. With MAX_CHILDREN==1 this
-        // only walks scanout 0, but the pattern survives a future
-        // multi-monitor refactor.
+        // The host window's size and EDID both changed: refresh them, make
+        // the new size a mode of the monitor that is already there, and let
+        // dxgkrnl look at the child again.  viogpuap then applies the size
+        // (VIOGPU_GET_CUSTOM_RESOLUTION) when NotifyResolutionEvent fires.
+        vidpn.GetDisplayInfo();
+        vidpn.RefreshEdid();
+        vidpn.AddCustomMonitorMode(0);
+
+        BOOLEAN connected = TRUE;
         PGPU_VBUFFER vbuf = NULL;
         if (ctrlQueue.AskDisplayInfo(&vbuf))
         {
+            // Walks scanout 0 only (MAX_CHILDREN == 1), but the pattern
+            // survives a future multi-monitor refactor.
             for (UINT i = 0; i < MAX_CHILDREN && i < m_u32NumScanouts; i++)
             {
                 ULONG xres = 0, yres = 0;
-                BOOLEAN connected = ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
-                UpdateChildStatus(connected);
+                connected = ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
+                UpdateChildStatus(connected, connected);
             }
             ctrlQueue.ReleaseBuffer(vbuf);
         }
@@ -3721,7 +3732,7 @@ void VioGpuAdapter::ConfigChanged(void)
         {
             // Fall back to the previous always-connect behaviour if
             // the host did not give us info.
-            UpdateChildStatus(TRUE);
+            UpdateChildStatus(TRUE, TRUE);
         }
     }
 }

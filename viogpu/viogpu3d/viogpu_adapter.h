@@ -120,6 +120,15 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN HasVenusPool() const { return m_PoolMode && m_VenusPoolSize != 0; }
     ULONGLONG VenusPoolBase() const { return m_VenusPoolBase; }
     ULONGLONG VenusPoolSize() const { return m_VenusPoolSize; }
+    // Bytes of the venus pool currently handed to blobs (mapped, not yet destroyed) and how many blobs.
+    // Accounting only: the host owns the pool and its allocator; this tells a full pool from other failures.
+    void VenusPoolAccount(LONGLONG bytes)
+    {
+        InterlockedExchangeAdd64(&m_VenusPoolUsed, bytes);
+        InterlockedExchangeAdd(&m_VenusPoolBlobs, bytes > 0 ? 1 : -1);
+    }
+    ULONGLONG VenusPoolUsed() const { return (ULONGLONG)m_VenusPoolUsed; }
+    LONG VenusPoolBlobs() const { return m_VenusPoolBlobs; }
     ULONGLONG ShmemWindowBytes() const { return m_PoolMode ? m_PoolKmdBytes : m_VioDev.shmem.length; }
     // Segment-relative (or segment-global) VidMm segment address -> physical address in the
     // GPU_GUEST pool; 0 when it does not name pool memory.
@@ -339,6 +348,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     ULONGLONG m_GuestPoolSize = 0;
     ULONGLONG m_VenusPoolBase = 0;
     ULONGLONG m_VenusPoolSize = 0;
+    volatile LONG64 m_VenusPoolUsed = 0;
+    volatile LONG m_VenusPoolBlobs = 0;
     ULONGLONG m_PoolKmdBytes = 0;   // segment 2 (KMD-owned window): [0, m_PoolKmdBytes)
     ULONGLONG m_PoolVidmmBytes = 0; // segment 1 (VidMm): [m_PoolKmdBytes, m_GuestPoolSize)
     PUCHAR m_GuestPoolVa = NULL;
@@ -916,7 +927,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     VOID NotifyResolutionEvent(VOID);
     VOID CloseResolutionEvent(VOID);
 
-    NTSTATUS UpdateChildStatus(BOOLEAN connect);
+    NTSTATUS UpdateChildStatus(BOOLEAN connect, BOOLEAN force = FALSE);
 
     NTSTATUS SetPowerState(DXGK_DEVICE_INFO *pDeviceInfo,
                            DEVICE_POWER_STATE DevicePowerState,

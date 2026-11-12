@@ -1291,7 +1291,14 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
         return Status;
     }
 
-    pVbeModeInfo = &m_ModeInfo[m_CurrentModeIndex];
+    // The preferred mode is the host's window size (the custom slot, which
+    // starts out as a copy of the nominal mode when the host reports nothing).
+    pVbeModeInfo = &m_ModeInfo[m_CustomModeIndex];
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s: preferred mode %lux%lu\n",
+              __FUNCTION__,
+              pVbeModeInfo->VisScreenWidth,
+              pVbeModeInfo->VisScreenHeight));
 
     BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo);
 
@@ -1916,24 +1923,56 @@ BOOLEAN VioGpuVidPN::GetDisplayInfo(void)
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
     PGPU_VBUFFER vbuf = NULL;
-    ULONG xres = 0;
-    ULONG yres = 0;
+    BOOLEAN have = FALSE;
 
-    for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts; i++)
+    // One GET_DISPLAY_INFO answers for every scanout.  Only scanout 0 is a
+    // child of this adapter (MAX_CHILDREN == 1); xres/yres are reset per
+    // scanout so a disabled one cannot inherit the previous one's size.
+    if (m_pAdapter->ctrlQueue.AskDisplayInfo(&vbuf))
     {
-        if (m_pAdapter->ctrlQueue.AskDisplayInfo(&vbuf))
+        for (UINT32 i = 0; i < m_pAdapter->m_u32NumScanouts && i < MAX_CHILDREN; i++)
         {
-            m_pAdapter->ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres);
-            m_pAdapter->ctrlQueue.ReleaseBuffer(vbuf);
-            if (xres && yres)
+            ULONG xres = 0;
+            ULONG yres = 0;
+            if (m_pAdapter->ctrlQueue.GetDisplayInfo(vbuf, i, &xres, &yres) && xres && yres)
             {
-                DbgPrint(TRACE_LEVEL_FATAL, ("---> %s (%dx%d)\n", __FUNCTION__, xres, yres));
+                DbgPrint(TRACE_LEVEL_FATAL, ("---> %s scanout %u (%lux%lu)\n", __FUNCTION__, i, xres, yres));
                 SetCustomDisplay((USHORT)xres, (USHORT)yres);
+                have = TRUE;
             }
         }
+        m_pAdapter->ctrlQueue.ReleaseBuffer(vbuf);
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s: GET_DISPLAY_INFO failed\n", __FUNCTION__));
     }
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
-    return TRUE;
+    return have;
+}
+
+// Re-read the host EDID after a display event: the host builds it from the
+// window's current mode, so it is stale as soon as the size changes.
+void VioGpuVidPN::RefreshEdid(void)
+{
+    PAGED_CODE();
+
+    if (!virtio_is_feature_enabled(m_pAdapter->m_u64HostFeatures, VIRTIO_GPU_F_EDID))
+    {
+        return;
+    }
+    GetEdids();
+    ParseEdidTiming();
+    if (m_EdidSize[0])
+    {
+        NormalizeHostEdid();
+    }
+    DbgPrint(TRACE_LEVEL_FATAL,
+             ("%s: edid %lu bytes, refresh %u/%u\n",
+              __FUNCTION__,
+              (ULONG)GetEdidSize(0),
+              m_EdidRefresh.Numerator,
+              m_EdidRefresh.Denominator));
 }
 
 int VioGpuVidPN::ProcessEdid(void)

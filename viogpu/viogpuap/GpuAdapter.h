@@ -78,6 +78,8 @@ class GpuAdapter
     DISPLAYCONFIG_MODE_INFO *GetDisplayConfig(UINT index);
     bool GetCustomResolution(PVIOGPU_DISP_MODE mode);
     bool SetResolution(PVIOGPU_DISP_MODE mode);
+    bool SyncResolution(void);
+    void SyncAndConfirm(void);
     void UpdateDisplayConfig(void);
     void ClearDisplayConfig(void);
 
