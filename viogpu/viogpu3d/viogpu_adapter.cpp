@@ -4288,17 +4288,32 @@ VioGpuAllocation *VioGpuAdapter::CookieMapLookup(ULONGLONG cookie)
 
 // ---- Gunyah protected VM pools ---------------------------------------------------------------
 
+// RTL_QUERY_REGISTRY_DIRECT cannot be used for a REG_QWORD: for data larger than a ULONG the
+// EntryContext buffer must start with its negative size, so a direct query wrote garbage over the
+// default (every pool size came out as 0xB00000000 = 44 GB while the real pools are 512 MB). Use a
+// query routine instead and only accept a real 8-byte REG_QWORD.
+static NTSTATUS NTAPI ReadQwordRoutine(PWSTR ValueName, ULONG ValueType, PVOID ValueData, ULONG ValueLength,
+                                       PVOID Context, PVOID EntryContext)
+{
+    UNREFERENCED_PARAMETER(ValueName);
+    UNREFERENCED_PARAMETER(Context);
+    if (ValueType == REG_QWORD && ValueLength == sizeof(ULONGLONG) && ValueData != NULL)
+    {
+        RtlCopyMemory(EntryContext, ValueData, sizeof(ULONGLONG));
+    }
+    return STATUS_SUCCESS;
+}
+
 static ULONGLONG ReadQwordParameter(PCWSTR name, ULONGLONG defaultValue)
 {
     ULONGLONG value = defaultValue;
     RTL_QUERY_REGISTRY_TABLE query[2];
     RtlZeroMemory(query, sizeof(query));
-    query[0].Flags = RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK;
+    query[0].QueryRoutine = ReadQwordRoutine;
+    query[0].Flags = RTL_QUERY_REGISTRY_NOEXPAND;
     query[0].Name = (PWSTR)name;
     query[0].EntryContext = &value;
-    query[0].DefaultType = (REG_QWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_QWORD;
-    query[0].DefaultData = &defaultValue;
-    query[0].DefaultLength = sizeof(defaultValue);
+    query[0].DefaultType = REG_NONE;
     NTSTATUS status = RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, L"VioGpu3D\\Parameters", query, NULL, NULL);
     if (!NT_SUCCESS(status))
     {
