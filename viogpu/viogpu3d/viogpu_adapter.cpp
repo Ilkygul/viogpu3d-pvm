@@ -2941,12 +2941,14 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                     DbgPrint(TRACE_LEVEL_ERROR,
                              ("<--> %s pvbuf=%p has no resp_buf for cmd_type=0x%x\n",
                               __FUNCTION__, pvbuf, pcmd ? pcmd->type : 0));
+                    // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+                    BOOLEAN pvbufAutoRelease = pvbuf->auto_release;
                     if (pvbuf->complete_cb != NULL &&
                         InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
                     {
                         pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, NULL);
                     }
-                    if (pvbuf->auto_release)
+                    if (pvbufAutoRelease)
                     {
                         ctrlQueue.ReleaseBuffer(pvbuf);
                     }
@@ -3001,12 +3003,14 @@ VOID VioGpuAdapter::DpcRoutine(VOID)
                               resp->ctx_id,
                               pcmd->type));
                 }
+                // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+                BOOLEAN pvbufAutoRelease = pvbuf->auto_release;
                 if (pvbuf->complete_cb != NULL &&
                     InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
                 {
                     pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, pvbuf->resp_buf);
                 }
-                if (pvbuf->auto_release)
+                if (pvbufAutoRelease)
                 {
                     ctrlQueue.ReleaseBuffer(pvbuf);
                 }

@@ -164,6 +164,7 @@ PVIOGPU_WAIT_CTX VioGpuAllocWaitCtx()
     ctx->refCount = 1;
     ctx->vbuf = NULL;
     ctx->abandoned = 0;
+    ctx->queue = NULL;
     return ctx;
 }
 
@@ -187,9 +188,12 @@ void VioGpuWaitCtxCompleteCB(void *p, void *, void *)
         // released a vbuf that meanwhile belonged to a DIFFERENT
         // in-flight command -- eating that command's completion (the
         // commander wedges on its running slot and dxgkrnl TDRs).
-        if (ctx->abandoned && ctx->vbuf)
+        // F92: the completion paths sample auto_release BEFORE calling us and never touch the
+        // vbuf afterwards, so flipping auto_release here would leak it. The caller is gone and
+        // nobody else owns the vbuf: release it here, exactly once.
+        if (ctx->abandoned && ctx->vbuf && ctx->queue)
         {
-            ctx->vbuf->auto_release = true;
+            ctx->queue->ReleaseBuffer(ctx->vbuf);
         }
         delete ctx;
     }
@@ -408,6 +412,7 @@ BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -520,6 +525,7 @@ BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -640,6 +646,7 @@ BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -714,6 +721,7 @@ BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_si
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -867,6 +875,7 @@ bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLO
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -1331,6 +1340,7 @@ BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offse
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -1468,6 +1478,7 @@ BOOLEAN CtrlQueue::ResourceUnmapBlobSync(UINT res_id, UINT ctx_id)
         return FALSE;
     }
     waitCtx->vbuf = vbuf;
+    waitCtx->queue = this;
     InterlockedIncrement(&waitCtx->refCount);
     vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
     vbuf->complete_ctx = waitCtx;
@@ -1760,11 +1771,13 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick, BOOLEAN *accepted)
         // vbuf (mirroring the AddBuf-failure arm) so the owning command
         // advances and dxgkrnl sees the fence retire instead of timing the
         // engine out (VidSchWaitForCompletionEvent TDR).
+        // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+        BOOLEAN bufAutoRelease = buf->auto_release;
         if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
         }
-        if (buf->auto_release)
+        if (bufAutoRelease)
         {
             ReleaseBuffer(buf);
         }
@@ -1846,12 +1859,14 @@ UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick, BOOLEAN *accepted)
                  ("<--> %s AddBuf failed rc=%d; firing complete_cb\n",
                   __FUNCTION__, rc));
         UnstageVbuf(buf, FALSE);
+        // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+        BOOLEAN bufAutoRelease = buf->auto_release;
         if (buf->complete_cb &&
             InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
         }
-        if (buf->auto_release)
+        if (bufAutoRelease)
         {
             ReleaseBuffer(buf);
         }
@@ -1881,11 +1896,13 @@ void CtrlQueue::SubmitPendingLocked()
         {
             RemoveHeadList(&m_PendingBufs);
             UnstageVbuf(buf, FALSE);
+            // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+            BOOLEAN bufAutoRelease = buf->auto_release;
             if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
             {
                 buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
             }
-            if (buf->auto_release)
+            if (bufAutoRelease)
             {
                 ReleaseBuffer(buf);
             }
@@ -1957,11 +1974,13 @@ void CtrlQueue::Close(void)
         PGPU_VBUFFER buf = CONTAINING_RECORD(RemoveHeadList(&parked), GPU_VBUFFER, pending_entry);
 
         UnstageVbuf(buf, FALSE);
+        // F92: decide ownership before the callback; it can wake a caller that frees the vbuf.
+        BOOLEAN bufAutoRelease = buf->auto_release;
         if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
         {
             buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
         }
-        if (buf->auto_release)
+        if (bufAutoRelease)
         {
             ReleaseBuffer(buf);
         }

@@ -98,6 +98,10 @@ typedef struct viogpu_wait_ctx
     // callback's KeSetEvent and its own decrement, and the callback
     // must then NOT auto-release a vbuf the caller still owns.
     volatile LONG abandoned;
+    // F92: queue that owns vbuf. On the abandoned path the completion callback releases the
+    // vbuf itself; the DPC no longer reads the vbuf after the callback (it may already be freed
+    // and reused by the woken caller).
+    class VioGpuQueue *queue;
 } VIOGPU_WAIT_CTX, *PVIOGPU_WAIT_CTX;
 
 class VioGpuQueue;
