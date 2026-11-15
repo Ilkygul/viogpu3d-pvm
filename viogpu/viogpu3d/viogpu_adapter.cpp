@@ -608,6 +608,8 @@ VioGpuAdapter::VioGpuAdapter(_In_ DEVICE_OBJECT *pPhysicalDeviceObject)
     RtlZeroMemory(&m_DxgkInterface, sizeof(m_DxgkInterface));
     RtlZeroMemory(&m_DeviceInfo, sizeof(m_DeviceInfo));
     RtlZeroMemory(&m_PointerShape, sizeof(m_PointerShape));
+    m_pCursorBuf = NULL;
+    m_CursorShown = FALSE;
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 
     RtlZeroMemory(&m_VioDev, sizeof(m_VioDev));
@@ -679,6 +681,7 @@ VioGpuAdapter::~VioGpuAdapter(void)
     VioGpuAdapterClose();
     HWClose();
     // protected VM: the frame segment's pool region first, then everything else rdmapool lent us
+    ReleaseCursorMemory();
     frameSegment.Close();
     PoolsClose();
     VioGpuRdmaShutdown();
@@ -1320,13 +1323,17 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 // it is not a statement about the PCI class of the device.
                 pDriverCaps->SupportNonVGA = TRUE;
 
-                // Disable pointer on viogpu3d for now
-                // if (IsPointerEnabled()) {
-                //    pDriverCaps->MaxPointerWidth = POINTER_SIZE;
-                //    pDriverCaps->MaxPointerHeight = POINTER_SIZE;
-                //    pDriverCaps->PointerCaps.Value = 0;
-                //    pDriverCaps->PointerCaps.Color = 1;
-                //}
+                // F93: hardware cursor through the virtio-gpu cursor queue (crosvm draws it as its
+                // own layer, so a mouse move no longer costs a DWM recomposition of the screen).
+                // Color (ARGB) and monochrome shapes; a masked-color shape is refused and Windows
+                // draws that one in software. Off with the HWCursor=0 registry value.
+                if (IsPointerEnabled()) {
+                    pDriverCaps->MaxPointerWidth = POINTER_SIZE;
+                    pDriverCaps->MaxPointerHeight = POINTER_SIZE;
+                    pDriverCaps->PointerCaps.Value = 0;
+                    pDriverCaps->PointerCaps.Color = 1;
+                    pDriverCaps->PointerCaps.Monochrome = 1;
+                }
 
                 // Surely this is enough...
                 // pDriverCaps->NumberOfSwizzlingRanges = 1024;
@@ -3277,6 +3284,7 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
     }
 
     DWORD value = 0;
+    SetPointerEnabled(TRUE); // F93: hardware cursor on unless HWCursor=0
     Status = ReadRegistryDWORD(DevInstRegKeyHandle, L"HWCursor", &value);
     if (NT_SUCCESS(Status))
     {
@@ -3866,6 +3874,7 @@ NTSTATUS VioGpuAdapter::HWClose(void)
         m_pWorkThread = NULL;
     }
 
+    ReleaseCursorMemory();
     frameSegment.Close();
 
     DbgPrint(TRACE_LEVEL_INFORMATION, ("<--- %s\n", __FUNCTION__));
@@ -4790,4 +4799,167 @@ VioGpuResource *VioGpuAdapter::ResourceFromHandle(D3DKMT_HANDLE handle)
     getHandleData.Type = DXGK_HANDLE_RESOURCE;
     getHandleData.Flags.DeviceSpecific = 0;
     return VioGpuResource::FromHandle(m_DxgkInterface.DxgkCbGetHandleData(&getHandleData));
+}
+
+
+// ---- F93 hardware cursor --------------------------------------------------------------------------
+// A 64x64 B8G8R8A8 resource whose backing lives in a VioGpuMemSegment: in the protected VM that is a
+// shared pool region (VioGpuRdmaRegionAlloc), the only memory crosvm may read. Shapes are copied in,
+// sent with TRANSFER_TO_HOST_2D and shown with UPDATE_CURSOR; positions go out as MOVE_CURSOR. The
+// cursor queue stages its commands in shared memory itself (CrsrQueue::QueueCursor).
+
+void VioGpuAdapter::ReleaseCursorMemory(void)
+{
+    PAGED_CODE();
+    // Teardown only: the queues are going away with the device, so no host commands are sent.
+    if (m_pCursorBuf)
+    {
+        delete m_pCursorBuf;
+        m_pCursorBuf = NULL;
+    }
+    m_CursorSegment.Close();
+    m_CursorShown = FALSE;
+}
+
+BOOLEAN VioGpuAdapter::CursorEnsure(void)
+{
+    PAGED_CODE();
+    if (m_pCursorBuf)
+        return TRUE;
+    const UINT size = POINTER_SIZE * POINTER_SIZE * 4;
+    if (m_CursorSegment.GetSize() == 0 && !m_CursorSegment.Init(size, NULL))
+    {
+        VioGpuRegLog("cursor: no memory segment for %u bytes\n", size);
+        return FALSE;
+    }
+    VioGpuObj *obj = new (NonPagedPoolNx) VioGpuObj();
+    if (!obj)
+        return FALSE;
+    if (!obj->Init(size, &m_CursorSegment))
+    {
+        delete obj;
+        return FALSE;
+    }
+    PSCATTER_GATHER_LIST sgl = obj->GetSGList();
+    if (!sgl || sgl->NumberOfElements == 0)
+    {
+        delete obj;
+        return FALSE;
+    }
+    PGPU_MEM_ENTRY ents = reinterpret_cast<PGPU_MEM_ENTRY>(
+        new (NonPagedPoolNx) BYTE[sizeof(GPU_MEM_ENTRY) * sgl->NumberOfElements]);
+    if (!ents)
+    {
+        delete obj;
+        return FALSE;
+    }
+    for (UINT i = 0; i < sgl->NumberOfElements; i++)
+    {
+        ents[i].addr = sgl->Elements[i].Address.QuadPart;
+        ents[i].length = sgl->Elements[i].Length;
+        ents[i].padding = 0;
+    }
+    UINT resid = resourceIdr.GetId();
+    ctrlQueue.CreateResource(resid, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, POINTER_SIZE, POINTER_SIZE);
+    // AttachBacking owns ents from here on, success or not.
+    if (!ctrlQueue.AttachBacking(resid, ents, sgl->NumberOfElements))
+    {
+        VioGpuRegLog("cursor: ATTACH_BACKING refused for res %u\n", resid);
+        ctrlQueue.DestroyResource(resid, NotifyResourceDestroyed, &resourceIdr);
+        delete obj;
+        return FALSE;
+    }
+    obj->SetId(resid);
+    m_pCursorBuf = obj;
+    VioGpuRegLog("cursor: res %u ready (%u entries)\n", resid, (UINT)sgl->NumberOfElements);
+    return TRUE;
+}
+
+BOOLEAN VioGpuAdapter::CursorQueue(UINT type, UINT resId, INT x, INT y, UINT hotX, UINT hotY)
+{
+    PAGED_CODE();
+    PGPU_VBUFFER vbuf = NULL;
+    PGPU_UPDATE_CURSOR crsr = (PGPU_UPDATE_CURSOR)m_CursorQueue.AllocCursor(&vbuf);
+    if (!crsr || !vbuf)
+        return FALSE;
+    RtlZeroMemory(crsr, sizeof(*crsr));
+    crsr->hdr.type = type;
+    crsr->resource_id = resId;
+    crsr->pos.scanout_id = 0;
+    crsr->pos.x = x < 0 ? 0 : (ULONG)x;
+    crsr->pos.y = y < 0 ? 0 : (ULONG)y;
+    crsr->hot_x = hotX;
+    crsr->hot_y = hotY;
+    m_CursorQueue.QueueCursor(vbuf);
+    return TRUE;
+}
+
+NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *s)
+{
+    PAGED_CODE();
+    if (!IsPointerEnabled() || s->VidPnSourceId != 0 || s->Width > POINTER_SIZE || s->Width == 0)
+        return STATUS_UNSUCCESSFUL;
+    const UINT h = s->Flags.Monochrome ? s->Height / 2 : s->Height;
+    if (h == 0 || h > POINTER_SIZE || !s->pPixels || (!s->Flags.Color && !s->Flags.Monochrome))
+        return STATUS_UNSUCCESSFUL; // masked color: Windows falls back to a software cursor
+    if (!CursorEnsure())
+        return STATUS_UNSUCCESSFUL;
+
+    ULONG *dst = (ULONG *)m_CursorSegment.GetVirtualAddress();
+    if (!dst)
+        return STATUS_UNSUCCESSFUL;
+    RtlZeroMemory(dst, POINTER_SIZE * POINTER_SIZE * 4);
+    const BYTE *src = (const BYTE *)s->pPixels;
+    for (UINT y = 0; y < h; y++)
+    {
+        ULONG *row = dst + y * POINTER_SIZE;
+        if (s->Flags.Color)
+        {
+            RtlCopyMemory(row, src + (SIZE_T)y * s->Pitch, s->Width * 4);
+        }
+        else
+        {
+            // 1 bpp AND mask over XOR mask: and=1/xor=0 transparent, and=0 opaque black/white,
+            // and=1/xor=1 (invert) shown as black (no invert in a plain ARGB plane).
+            const BYTE *andRow = src + (SIZE_T)y * s->Pitch;
+            const BYTE *xorRow = src + (SIZE_T)(y + h) * s->Pitch;
+            for (UINT x = 0; x < s->Width; x++)
+            {
+                const BYTE bit = (BYTE)(0x80 >> (x & 7));
+                const BOOLEAN a = (andRow[x >> 3] & bit) != 0;
+                const BOOLEAN xo = (xorRow[x >> 3] & bit) != 0;
+                row[x] = (a && !xo) ? 0x00000000u : ((!a && xo) ? 0xFFFFFFFFu : 0xFF000000u);
+            }
+        }
+    }
+    const UINT resid = m_pCursorBuf->GetId();
+    ctrlQueue.TransferToHost2D(resid, 0, POINTER_SIZE, POINTER_SIZE, 0, 0);
+    m_PointerShape = *s;
+    if (!CursorQueue(VIRTIO_GPU_CMD_UPDATE_CURSOR, resid, 0, 0, s->XHot, s->YHot))
+        return STATUS_UNSUCCESSFUL;
+    m_CursorShown = TRUE;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *p)
+{
+    PAGED_CODE();
+    if (!IsPointerEnabled() || p->VidPnSourceId != 0 || !m_pCursorBuf)
+        return STATUS_SUCCESS;
+    if (!p->Flags.Visible)
+    {
+        if (m_CursorShown && CursorQueue(VIRTIO_GPU_CMD_UPDATE_CURSOR, 0, 0, 0, 0, 0))
+            m_CursorShown = FALSE; // resource 0 hides the host's cursor layer
+        return STATUS_SUCCESS;
+    }
+    if (!m_CursorShown)
+    {
+        // Shown again after a hide: re-arm the shape at the new position.
+        if (CursorQueue(VIRTIO_GPU_CMD_UPDATE_CURSOR, m_pCursorBuf->GetId(), p->X, p->Y,
+                        m_PointerShape.XHot, m_PointerShape.YHot))
+            m_CursorShown = TRUE;
+        return STATUS_SUCCESS;
+    }
+    CursorQueue(VIRTIO_GPU_CMD_MOVE_CURSOR, m_pCursorBuf->GetId(), p->X, p->Y, 0, 0);
+    return STATUS_SUCCESS;
 }

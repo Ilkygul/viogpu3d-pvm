@@ -476,7 +476,6 @@ APIENTRY
 VioGpu3DSetPointerPosition(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(pSetPointerPosition);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
@@ -488,12 +487,8 @@ VioGpu3DSetPointerPosition(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOI
         VioGpuDbgBreak();
         return STATUS_UNSUCCESSFUL;
     }
-    // Positioning alone never draws anything (no shape is ever programmed --
-    // see the zeroed PointerCaps in QueryAdapterInfo), and the DDI is
-    // documented to return STATUS_SUCCESS while making no state changes.
-    // DxgkDdiSetPointerShape deliberately keeps returning an error instead:
-    // success there would claim a hardware pointer had been drawn.
-    return STATUS_SUCCESS;
+    // F93: the adapter now programs a hardware cursor (QueryAdapterInfo advertises it).
+    return pAdapter->SetPointerPosition(pSetPointerPosition);
 }
 
 NTSTATUS
@@ -501,7 +496,6 @@ APIENTRY
 VioGpu3DSetPointerShape(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(pSetPointerShape);
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<---> %s\n", __FUNCTION__));
 
     VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
@@ -513,7 +507,7 @@ VioGpu3DSetPointerShape(_In_ CONST HANDLE hAdapter, _In_ CONST DXGKARG_SETPOINTE
                  ("<---> %s VioGpu (%p) is being called when not active!\n", __FUNCTION__, pAdapter));
         return STATUS_UNSUCCESSFUL;
     }
-    return STATUS_NOT_IMPLEMENTED;
+    return pAdapter->SetPointerShape(pSetPointerShape); // F93
 }
 
 NTSTATUS

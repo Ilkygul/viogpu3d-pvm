@@ -174,6 +174,9 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
 
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
+    BOOLEAN m_CursorShown;
+    BOOLEAN CursorEnsure(void);
+    BOOLEAN CursorQueue(UINT type, UINT resId, INT x, INT y, UINT hotX, UINT hotY);
 
     ULONG m_PciBus;
     ULONG m_PciDev;
@@ -261,6 +264,11 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     VOID PoolsInit(VOID);
     VOID PoolsClose(VOID);
     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
+
+    // F93 hardware cursor (virtio-gpu cursor queue; crosvm shows it as its own surface)
+    NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
+    NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition);
+    void ReleaseCursorMemory(void);
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
     NTSTATUS StopDeviceAndReleasePostDisplayOwnership(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                       _Out_ DXGK_DISPLAY_INFORMATION *pDisplayInfo);
