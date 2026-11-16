@@ -144,6 +144,13 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     // VidMm's pool segment: id 1 (replaces the aperture) or, with the PoolKeepAperture QWORD
     // parameter = 1, id 3 behind the unchanged (unused) aperture segment 1 and window segment 2.
     UINT PoolVidmmSegId() const { return m_PoolKeepAperture ? 3 : 1; }
+    /* F98 (MemReport, default on): the VENUS_HOST pool is GPU memory too; report it as one more
+     * non-aperture segment (after the others, so their ids do not move; no allocation names it). */
+    BOOLEAN HasVenusSegment() const { return m_MemReport && m_PoolMode && m_VenusPoolSize != 0; }
+    UINT BaseSegmentCount() const { return m_PoolMode ? (m_PoolKeepAperture ? 3 : 2) : (m_VioDev.shmem.available ? 2 : 1); }
+    UINT SegmentCount() const { return BaseSegmentCount() + (HasVenusSegment() ? 1 : 0); }
+    ULONGLONG DedicatedBytes() const;
+    template <typename DESC> void FillVenusSegment(DESC *pDesc);
     ULONGLONG PoolVidmmSegBase() const { return m_PoolKeepAperture ? 0x500000000ull : 0xC0000000ull; }
 
     static const ULONGLONG SHMEM_GPU_BASE_VA = 0x700000000;
@@ -354,6 +361,7 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN m_PoolMode = FALSE;
     BOOLEAN m_PoolsTried = FALSE;
     BOOLEAN m_PoolKeepAperture = FALSE;
+    BOOLEAN m_MemReport = TRUE;
     ULONGLONG m_GuestPoolBase = 0;
     ULONGLONG m_GuestPoolSize = 0;
     ULONGLONG m_VenusPoolBase = 0;
