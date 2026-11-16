@@ -2388,6 +2388,16 @@ int VioGpuVidPN::AddEdidModes(void)
     int modecount = 0;
     UpdateModes(MIN_WIDTH_SIZE, MIN_HEIGHT_SIZE, modecount);
     UpdateModes(NOM_WIDTH_SIZE, NOM_HEIGHT_SIZE, modecount);
+    // F97: fixed choices for the clipsync "Resolutie" menu (besides the host window size, the custom slot).
+    UpdateModes(1920, 1080, modecount);
+    UpdateModes(2560, 1440, modecount);
+    // The Fold's own screens in both orientations (inner 2448x1848, cover 1248x1972) and a 4K screen via DeX,
+    // for "Schermeigen" when the VM window is smaller than the screen.
+    UpdateModes(2448, 1848, modecount);
+    UpdateModes(1848, 2448, modecount);
+    UpdateModes(1972, 1248, modecount);
+    UpdateModes(1248, 1972, modecount);
+    UpdateModes(3840, 2160, modecount);
     if (est_timing_1_2.Timing_800x600_60 || est_timing_1_2.Timing_800x600_56 || est_timing_1_2.Timing_800x600_75 ||
         est_timing_1_2.Timing_800x600_72)
     {
