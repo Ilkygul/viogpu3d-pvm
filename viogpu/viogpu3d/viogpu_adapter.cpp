@@ -243,6 +243,12 @@ static BOOLEAN ReportCompletedSyncRoutine(PVOID ctx_void)
     }
     else
     {
+    if (a->m_TestHangArmed)
+    {
+        a->m_TestHangArmed = 0; // F94 TDR test: this completion is lost, everything after it waits for TDR
+        ctx->Raised = FALSE;
+        return TRUE;
+    }
     const LONG last = a->m_LastCompletedFenceId;
     if ((LONG)(ctx->FenceId - (UINT)last) <= 0)
     {
@@ -2057,6 +2063,17 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
             {
                 return MarkThreadTokenPacketGate(PsGetCurrentThreadId()) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
             }
+        case VIOGPU_TEST_HANG:
+            {
+                // F94: simulate a host that stops answering: the next fence completion is swallowed, the
+                // contiguity window pins and dxgkrnl must recover through TDR (ResetFenceStateFromTimeout).
+                if (!m_TestHangAllowed || m_NativeGpuJobV1)
+                {
+                    return STATUS_NOT_SUPPORTED;
+                }
+                InterlockedExchange(&m_TestHangArmed, 1);
+                break;
+            }
         default:
             DbgPrint(TRACE_LEVEL_ERROR, ("%s: invalid Escape type 0x%x\n", __FUNCTION__, pVioGpuEscape->Type));
             status = STATUS_INVALID_PARAMETER;
@@ -3269,6 +3286,12 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
     NTSTATUS nativeStatus = RtlQueryRegistryValues(RTL_REGISTRY_SERVICES,
         L"VioGpu3D\\Parameters", nativeQuery, NULL, NULL);
     m_NativeGpuJobV1 = (BOOLEAN)(NT_SUCCESS(nativeStatus) && nativeValue == 1);
+    ULONG hangValue = 0;
+    nativeQuery[0].Name = (PWSTR)L"TestHangEscape";
+    nativeQuery[0].EntryContext = &hangValue;
+    NTSTATUS hangStatus = RtlQueryRegistryValues(RTL_REGISTRY_SERVICES,
+        L"VioGpu3D\\Parameters", nativeQuery, NULL, NULL);
+    m_TestHangAllowed = (BOOLEAN)(NT_SUCCESS(hangStatus) && hangValue == 1);
     m_NativeModeRead = TRUE;
     }
 

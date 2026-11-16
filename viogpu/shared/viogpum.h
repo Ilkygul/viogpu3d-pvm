@@ -129,6 +129,7 @@ typedef struct _VIOGPU_ADAPTERINFO
 #define VIOGPU_GET_CUSTOM_RESOLUTION 0x001
 #define VIOGPU_GET_CAPS              0x002
 #define VIOGPU_GET_PCI_INFO          0x003
+#define VIOGPU_TEST_HANG             0x0F0 // F94: swallow one fence completion (TDR test; needs Parameters\TestHangEscape=1 at boot)
 
 #define VIOGPU_RES_INFO              0x100
 #define VIOGPU_RES_BUSY              0x101

@@ -2040,13 +2040,49 @@ void VioGpuBuf::Close(void)
     LIST_ENTRY drained;
     InitializeListHead(&drained);
 
+    // F94: a vbuf with auto_release == FALSE belongs to a synchronous caller (Ask*, *Sync): the callback
+    // wakes it and it still reads the response before its own ReleaseBuffer. Deleting such a vbuf here was
+    // a use-after-free for that caller. Leave it on the in-use list (FreeBuf then works normally) and only
+    // wake its owner; anything still in use is reclaimed by the next Close (the destructor).
+    PGPU_VBUFFER *owned = NULL;
+    UINT nOwned = 0;
     KeAcquireSpinLock(&m_SpinLock, &OldIrql);
-    while (!IsListEmpty(&m_InUseBufs))
+    UINT cap = m_uCount;
+    KeReleaseSpinLock(&m_SpinLock, OldIrql);
+    if (cap)
+        owned = reinterpret_cast<PGPU_VBUFFER *>(new (NonPagedPoolNx) BYTE[sizeof(PGPU_VBUFFER) * cap]);
+
+    KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+    PLIST_ENTRY le = m_InUseBufs.Flink;
+    while (le != &m_InUseBufs)
     {
-        PLIST_ENTRY entry = RemoveHeadList(&m_InUseBufs);
-        InsertTailList(&drained, entry);
+        PLIST_ENTRY next = le->Flink;
+        PGPU_VBUFFER pv = CONTAINING_RECORD(le, GPU_VBUFFER, list_entry);
+        if (!pv->auto_release && pv->complete_cb && owned && nOwned < cap)
+        {
+            owned[nOwned++] = pv;
+        }
+        else
+        {
+            RemoveEntryList(le);
+            InsertTailList(&drained, le);
+        }
+        le = next;
     }
     KeReleaseSpinLock(&m_SpinLock, OldIrql);
+
+    // Wake the synchronous owners. Their vbufs are never deleted by FreeBuf (it moves them to the free
+    // list), so the pointers stay valid for this loop even if an owner releases one meanwhile.
+    for (UINT i = 0; i < nOwned; i++)
+    {
+        PGPU_VBUFFER pv = owned[i];
+        if (pv->complete_cb && InterlockedExchange(&pv->complete_fired, 1) == 0)
+        {
+            pv->complete_cb(pv->complete_ctx, pv->buf, pv->resp_buf);
+        }
+    }
+    if (owned)
+        delete[] reinterpret_cast<PBYTE>(owned);
 
     while (!IsListEmpty(&drained))
     {
@@ -2109,7 +2145,7 @@ void VioGpuBuf::Close(void)
     }
     KeReleaseSpinLock(&m_SpinLock, OldIrql);
 
-    ASSERT(m_uCount == 0);
+    // F94: synchronous owners may still hold their vbufs (reclaimed by the next Close).
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }

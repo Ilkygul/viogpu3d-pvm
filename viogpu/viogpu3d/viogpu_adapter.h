@@ -419,6 +419,9 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN m_NativeGpuJobV1 = FALSE;
     BOOLEAN m_NativeModeRead = FALSE;
     volatile LONG m_NativeGpuFault = 0;
+    // F94 TDR test hook (legacy route only): boot-read opt-in, armed by VIOGPU_TEST_HANG.
+    BOOLEAN m_TestHangAllowed = FALSE;
+    volatile LONG m_TestHangArmed = 0;
     LIST_ENTRY m_NativeDmaList;
     UINT m_NativeDmaCount = 0;
     NTSTATUS NativeRegisterFence(NATIVE_DMA_RECORD *record, UINT node, UINT engine);
