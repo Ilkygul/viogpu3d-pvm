@@ -2794,13 +2794,27 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
     // SetScanoutSource) scan out by res_id through SetScanoutBlob and carry
     // no guest PrimaryAddress, so flush them regardless of address; only 3D
     // primaries are gated on a non-zero MMIO-flip address.
-    if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
+    // F99 FlipDedup: a legacy (unfenced) latch of the very content the last flush already sent -- typically
+    // dxgkrnl's SetVidPnSourceAddress arriving after the fenced flip was promoted -- only re-reports the
+    // address; a second SET_SCANOUT + RESOURCE_FLUSH would make the host copy the same frame again.
+    const BOOLEAN bltRearm = InterlockedExchange(&m_bltRearm, 0) != 0;
+    if (res != NULL && required == 0 && !bltRearm && m_flipDedup && res == m_lastFlushedRes &&
+        address.QuadPart == m_lastFlushedAddr && (address.QuadPart != 0 || res->IsBlob()))
+    {
+        InterlockedIncrement(&m_flipDedupSkips);
+    }
+    else if (res != NULL && (address.QuadPart != 0 || res->IsBlob()))
     {
         res->FlushToScreen(0);
+        m_lastFlushedRes = res;
+        m_lastFlushedAddr = address.QuadPart;
+        InterlockedIncrement(&m_flipFlushes);
     }
     else
     {
         m_pAdapter->ctrlQueue.SetScanout(0, 0, 0, 0, 0, 0);
+        m_lastFlushedRes = NULL;
+        m_lastFlushedAddr = 0;
     }
 
     if (res)
@@ -2822,7 +2836,14 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
     {
         InterlockedIncrement(&m_flipUngatedPromotes);
     }
-    InterlockedIncrement(&m_flipPromotes);
+    LONG promotes = InterlockedIncrement(&m_flipPromotes);
+    // F99 FlipLog: counters into the registry log every 4096 promotes (about a minute of animation).
+    if ((promotes & 4095) == 0)
+    {
+        VioGpuRegLog("fliplog: promotes=%ld gated=%ld ungated=%ld parked=%ld timeouts=%ld flushes=%ld dedup=%ld\n",
+                     promotes, m_flipGatedPromotes, m_flipUngatedPromotes, m_flipParked, m_flipTokenTimeouts,
+                     m_flipFlushes, m_flipDedupSkips);
+    }
 
     return TRUE;
 }
@@ -3078,6 +3099,7 @@ void VioGpuVidPN::RearmFlipIfScanout(VioGpuAllocation *res)
 
     if (isScanout)
     {
+        InterlockedOr(&m_bltRearm, 1);
         InterlockedOr(&m_shouldFlip, 1);
     }
 }

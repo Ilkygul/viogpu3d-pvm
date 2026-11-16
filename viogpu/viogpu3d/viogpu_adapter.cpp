@@ -1208,6 +1208,8 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
     pDesc->Flags.DirectFlip = TRUE;
 }
 
+static ULONGLONG ReadQwordParameter(PCWSTR name, ULONGLONG defaultValue);
+
 // F98: the VENUS_HOST pool (host GPU objects mapped into the protected VM) as a memory segment, so Windows
 // counts it as dedicated GPU memory.  CPU-invisible and never named by an allocation's segment set: it only
 // reports capacity.  GPU VA 0x900000000 stays clear of the aperture (0xC0000000), the VidMm pool segment
@@ -1337,7 +1339,11 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
                 // windowed flip-model (composition) presents were never
                 // bound by DWM (calc/UWP splash-blank, d3dtest9 probe
                 // invisible). Allow one queued flip per vsync.
-                pDriverCaps->MaxQueuedFlipOnVSync = 1;
+                // F99: Parameters\QueuedFlips (1 or 2, default 1): flips dxgkrnl may queue per vsync.
+                {
+                    ULONGLONG q = ReadQwordParameter(L"QueuedFlips", 1);
+                    pDriverCaps->MaxQueuedFlipOnVSync = (q >= 2) ? 2 : 1;
+                }
 
                 pDriverCaps->MemoryManagementCaps.SectionBackedPrimary = TRUE;
 
@@ -2096,6 +2102,27 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
         case VIOGPU_PRESENT_GATE_HINT:
             {
                 return MarkThreadTokenPacketGate(PsGetCurrentThreadId()) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+            }
+        case VIOGPU_FMT_TABLE:
+            {
+                // F100: adapter-wide format/MSAA support table (see VIOGPU_FMT_TABLE_REQ).
+                VIOGPU_FMT_TABLE_REQ *r = &pVioGpuEscape->FmtTable;
+                if (r->Op == 1 && r->Index < VIOGPU_FMT_TABLE_SLOTS)
+                {
+                    for (ULONG i = 0; i < 12; i++)
+                    {
+                        const ULONG s = r->Index + i;
+                        r->Entry[i] = s < VIOGPU_FMT_TABLE_SLOTS
+                            ? (ULONGLONG)InterlockedCompareExchange64(&m_FmtTable[s], 0, 0) : 0;
+                    }
+                    return STATUS_SUCCESS;
+                }
+                if (r->Op == 2 && r->Index < VIOGPU_FMT_TABLE_SLOTS && (r->Entry[0] >> 32) == 1)
+                {
+                    InterlockedCompareExchange64(&m_FmtTable[r->Index], (LONG64)r->Entry[0], 0);
+                    return STATUS_SUCCESS;
+                }
+                return STATUS_INVALID_PARAMETER;
             }
         case VIOGPU_TEST_HANG:
             {
@@ -4535,6 +4562,7 @@ VOID VioGpuAdapter::PoolsInit(VOID)
     }
     m_PoolsTried = TRUE;
     m_MemReport = ReadQwordParameter(L"MemReport", 1) != 0;
+    vidpn.SetFlipDedup(ReadQwordParameter(L"FlipDedup", 1) != 0);
     if (!VioGpuRdmaActive())
     {
         VioGpuRegLog("pool: no rdmapool, not a protected VM: stock memory model\n");

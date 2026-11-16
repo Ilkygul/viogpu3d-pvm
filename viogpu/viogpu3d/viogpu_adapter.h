@@ -362,6 +362,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN m_PoolsTried = FALSE;
     BOOLEAN m_PoolKeepAperture = FALSE;
     BOOLEAN m_MemReport = TRUE;
+    // F100: VIOGPU_FMT_TABLE, the format/MSAA answers one process got from the host, for every later process.
+    volatile LONG64 m_FmtTable[VIOGPU_FMT_TABLE_SLOTS] = {};
     ULONGLONG m_GuestPoolBase = 0;
     ULONGLONG m_GuestPoolSize = 0;
     ULONGLONG m_VenusPoolBase = 0;

@@ -129,6 +129,7 @@ typedef struct _VIOGPU_ADAPTERINFO
 #define VIOGPU_GET_CUSTOM_RESOLUTION 0x001
 #define VIOGPU_GET_CAPS              0x002
 #define VIOGPU_GET_PCI_INFO          0x003
+#define VIOGPU_FMT_TABLE             0x0F1 // F100/U51: adapter-wide format/MSAA support table shared by all processes
 #define VIOGPU_TEST_HANG             0x0F0 // F94: swallow one fence completion (TDR test; needs Parameters\TestHangEscape=1 at boot)
 
 #define VIOGPU_RES_INFO              0x100
@@ -327,6 +328,19 @@ typedef struct _VIOGPU_GATE_ARM_REQ
 #pragma pack()
 
 #pragma pack(1)
+// F100/U51: VIOGPU_FMT_TABLE.  Op 1 = get 12 slots from Index; Op 2 = put Entry[0] into slot Index (kept if the
+// slot already holds a value).  A slot is a UMD cache word (bit 32 = valid); 0 = unknown.  Exactly fills the
+// 104-byte escape union, so sizeof(VIOGPU_ESCAPE) is unchanged.
+#pragma pack(1)
+typedef struct _VIOGPU_FMT_TABLE_REQ
+{
+    ULONG Op;
+    ULONG Index;
+    ULONGLONG Entry[12];
+} VIOGPU_FMT_TABLE_REQ;
+#pragma pack()
+#define VIOGPU_FMT_TABLE_SLOTS 1024
+
 typedef struct _VIOGPU_ESCAPE
 {
     USHORT Type;
@@ -350,6 +364,8 @@ typedef struct _VIOGPU_ESCAPE
         VIOGPU_PRESENT_FENCE_REQ PresentFence;
 
         VIOGPU_GATE_ARM_REQ GateArm;
+
+        VIOGPU_FMT_TABLE_REQ FmtTable;
     } DUMMYUNIONNAME;
 } VIOGPU_ESCAPE, *PVIOGPU_ESCAPE;
 #pragma pack()

@@ -329,6 +329,19 @@ class VioGpuVidPN
     volatile LONG m_flipGatedPromotes = 0;
     volatile LONG m_flipUngatedPromotes = 0;
     volatile LONG m_flipParked = 0;
+    // F99: FlipDedup / FlipLog.  m_lastFlushedRes/m_lastFlushedAddr: what the last FlushToScreen sent; an
+    // address-only latch of the same content is not flushed twice.  m_bltRearm: a GDI blt into the scanout
+    // source re-arms and must flush again.
+    VioGpuAllocation *m_lastFlushedRes = NULL;
+    LONGLONG m_lastFlushedAddr = 0;
+    volatile LONG m_bltRearm = 0;
+    volatile LONG m_flipDedupSkips = 0;
+  public:
+    void SetFlipDedup(BOOLEAN on) { m_flipDedup = on; }
+  private:
+    volatile LONG m_flipFlushes = 0;
+    BOOLEAN m_flipDedup = TRUE;
+    ULONGLONG m_flipLogLastMs = 0;
 
     // NULL whenever no thread reference is held, so that the stop paths can
     // tell whether the reference is still theirs to drop.  Checked builds
