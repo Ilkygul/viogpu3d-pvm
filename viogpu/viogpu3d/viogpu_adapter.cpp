@@ -3316,6 +3316,13 @@ NTSTATUS VioGpuAdapter::GetRegisterInfo(void)
         SetPointerEnabled(!!value);
     }
 
+    value = 1;
+    vidpn.SetAllow120(TRUE); // F96: modes in 60 and 120 Hz unless Refresh120=0
+    if (NT_SUCCESS(ReadRegistryDWORD(DevInstRegKeyHandle, L"Refresh120", &value)))
+    {
+        vidpn.SetAllow120(!!value);
+    }
+
     value = 0;
     Status = ReadRegistryDWORD(DevInstRegKeyHandle, L"FlexResolution", &value);
     if (NT_SUCCESS(Status))

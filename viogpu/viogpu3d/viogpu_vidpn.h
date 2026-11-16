@@ -154,6 +154,11 @@ class VioGpuVidPN
     // Refresh rate every mode runs at: the host EDID's preferred timing,
     // or 60/1 when the host gave none. Never {0,0}.
     D3DDDI_RATIONAL GetActiveRefreshRate() const;
+    // F96: every mode in 60 and 120 Hz (Refresh120=0 in the adapter key turns 120 off); the pinned
+    // target mode's rate drives the vsync timer.
+    D3DDDI_RATIONAL GetBaseRefreshRate() const;
+    void SetAllow120(BOOLEAN on) { m_Allow120 = on; }
+    UINT GetRates(D3DDDI_RATIONAL rates[2]) const;
 
   private:
     NTSTATUS SetSourceModeAndPath(CONST D3DKMDT_VIDPN_SOURCE_MODE *pSourceMode,
@@ -168,6 +173,7 @@ class VioGpuVidPN
                                  D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId);
     D3DDDI_VIDEO_PRESENT_SOURCE_ID FindSourceForTarget(D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId, BOOLEAN DefaultToZero);
     VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo);
+    VOID BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo, D3DDDI_RATIONAL rate);
 
     // m_sourceLock is taken from PASSIVE/DISPATCH (mode set, FlipThread) and
     // also from DIRQL: with FlipCaps.FlipOnVSyncMmIo set, dxgkrnl runs
@@ -219,6 +225,8 @@ class VioGpuVidPN
     // dxgkrnl reads the monitor descriptor only at arrival, so a change of
     // host display takes effect at the next driver start.
     D3DDDI_RATIONAL m_EdidRefresh;
+    D3DDDI_RATIONAL m_PinnedRefresh = {0, 0};
+    BOOLEAN m_Allow120 = TRUE;
 
     DXGK_DISPLAY_INFORMATION m_SystemDisplayInfo;
     D3DDDI_VIDEO_PRESENT_SOURCE_ID m_SystemDisplaySourceId;

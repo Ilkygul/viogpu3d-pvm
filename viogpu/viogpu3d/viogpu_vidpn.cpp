@@ -515,6 +515,25 @@ NTSTATUS VioGpuVidPN::CommitVidPn(_In_ CONST DXGKARG_COMMITVIDPN *CONST pCommitV
             goto CommitVidPnExit;
         }
 
+        {
+            // F96: remember the committed target mode's refresh rate (60 or 120 Hz); the flip
+            // thread re-programs the vsync timer from it on its next tick.
+            D3DKMDT_HVIDPNTARGETMODESET hTms = 0;
+            CONST DXGK_VIDPNTARGETMODESET_INTERFACE *pTmsIf = NULL;
+            if (NT_SUCCESS(pVidPnInterface->pfnAcquireTargetModeSet(pCommitVidPn->hFunctionalVidPn, TargetId, &hTms, &pTmsIf)))
+            {
+                CONST D3DKMDT_VIDPN_TARGET_MODE *pTm = NULL;
+                if (NT_SUCCESS(pTmsIf->pfnAcquirePinnedModeInfo(hTms, &pTm)) && pTm != NULL)
+                {
+                    m_PinnedRefresh = pTm->VideoSignalInfo.VSyncFreq;
+                    DbgPrint(TRACE_LEVEL_FATAL, ("%s: refresh %u/%u\n", __FUNCTION__,
+                                                 m_PinnedRefresh.Numerator, m_PinnedRefresh.Denominator));
+                    pTmsIf->pfnReleaseModeInfo(hTms, pTm);
+                }
+                pVidPnInterface->pfnReleaseTargetModeSet(pCommitVidPn->hFunctionalVidPn, hTms);
+            }
+        }
+
         Status = SetSourceModeAndPath(pPinnedVidPnSourceModeInfo, pVidPnPresentPath);
         if (!NT_SUCCESS(Status))
         {
@@ -1242,16 +1261,22 @@ NTSTATUS VioGpuVidPN::AddSingleSourceMode(_In_ CONST DXGK_VIDPNSOURCEMODESET_INT
 VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo, PVIDEO_MODE_INFORMATION pModeInfo)
 {
     PAGED_CODE();
+    BuildVideoSignalInfo(pVideoSignalInfo, pModeInfo, GetBaseRefreshRate());
+}
+
+VOID VioGpuVidPN::BuildVideoSignalInfo(D3DKMDT_VIDEO_SIGNAL_INFO *pVideoSignalInfo,
+                                       PVIDEO_MODE_INFORMATION pModeInfo,
+                                       D3DDDI_RATIONAL rate)
+{
+    PAGED_CODE();
 
     pVideoSignalInfo->VideoStandard = D3DKMDT_VSS_OTHER;
     pVideoSignalInfo->TotalSize.cx = pModeInfo->VisScreenWidth;
     pVideoSignalInfo->TotalSize.cy = pModeInfo->VisScreenHeight;
     pVideoSignalInfo->ActiveSize = pVideoSignalInfo->TotalSize;
 
-    // Every mode runs at the host display's refresh rate (from the EDID's
-    // preferred timing; 60 Hz when the host gave none). The raster has no
+    // F96: the caller picks the rate (host EDID rate, or 120 Hz). The raster has no
     // blanking, so the line and pixel rates follow from the visible size.
-    D3DDDI_RATIONAL rate = GetActiveRefreshRate();
     pVideoSignalInfo->VSyncFreq = rate;
     pVideoSignalInfo->HSyncFreq.Numerator =
         (UINT)(((ULONGLONG)rate.Numerator * pModeInfo->VisScreenHeight) / rate.Denominator);
@@ -1300,6 +1325,10 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
     for (UINT ModeIndex = 0; ModeIndex < ModeCount; ++ModeIndex)
     {
         PVIDEO_MODE_INFORMATION pModeInfo = HavePinnedSource ? &PinnedMode : &m_ModeInfo[ModeIndex];
+        D3DDDI_RATIONAL rates[2];
+        const UINT nRates = GetRates(rates);
+        for (UINT r = 0; r < nRates; ++r)
+        {
         pVidPnTargetModeInfo = NULL;
         Status = pVidPnTargetModeSetInterface->pfnCreateNewModeInfo(hVidPnTargetModeSet, &pVidPnTargetModeInfo);
         if (!NT_SUCCESS(Status))
@@ -1310,7 +1339,7 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
                       LONG_PTR(hVidPnTargetModeSet)));
             return Status;
         }
-        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo);
+        BuildVideoSignalInfo(&pVidPnTargetModeInfo->VideoSignalInfo, pModeInfo, rates[r]);
 
         pVidPnTargetModeInfo->Preference = D3DKMDT_MP_NOTPREFERRED; // TODO: another logic for prefferred mode. Maybe
                                                                     // the pinned source mode
@@ -1331,6 +1360,7 @@ NTSTATUS VioGpuVidPN::AddSingleTargetMode(_In_ CONST DXGK_VIDPNTARGETMODESET_INT
             Status = pVidPnTargetModeSetInterface->pfnReleaseModeInfo(hVidPnTargetModeSet, pVidPnTargetModeInfo);
             NT_ASSERT(NT_SUCCESS(Status));
         }
+        } // F96 rates
     }
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
     return STATUS_SUCCESS;
@@ -1411,9 +1441,12 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
         }
     }
 
-    for (UINT Idx = 0; Idx < GetModeCount(); ++Idx)
+    D3DDDI_RATIONAL monRates[2];
+    const UINT nMonRates = GetRates(monRates);
+    for (UINT Idx = 0; Idx < GetModeCount() * nMonRates; ++Idx)
     {
-        pVbeModeInfo = &m_ModeInfo[Idx];
+        pVbeModeInfo = &m_ModeInfo[Idx % GetModeCount()];
+        const D3DDDI_RATIONAL monRate = monRates[Idx / GetModeCount()];
 
         Status = pRecommendMonitorModes->pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(pRecommendMonitorModes->hMonitorSourceModeSet,
                                                                                               &pMonitorSourceMode);
@@ -1432,7 +1465,7 @@ NTSTATUS VioGpuVidPN::AddSingleMonitorMode(_In_ CONST DXGKARG_RECOMMENDMONITORMO
                   pVbeModeInfo->VisScreenWidth,
                   pVbeModeInfo->VisScreenHeight));
 
-        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo);
+        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pVbeModeInfo, monRate);
 
         pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;
         pMonitorSourceMode->Preference = D3DKMDT_MP_NOTPREFERRED;
@@ -2826,9 +2859,30 @@ void VioGpuVidPN::Flip()
 
 D3DDDI_RATIONAL VioGpuVidPN::GetActiveRefreshRate() const
 {
-    // Every mode carries the host display's refresh rate, so the active
-    // rate does not depend on which mode is pinned; 60 Hz stands in when
-    // the host EDID gave none.
+    // F96: the rate of the target mode Windows committed; before the first commit the base rate.
+    D3DDDI_RATIONAL pinned = m_PinnedRefresh;
+    if (pinned.Numerator != 0 && pinned.Denominator != 0)
+    {
+        return pinned;
+    }
+    return GetBaseRefreshRate();
+}
+
+UINT VioGpuVidPN::GetRates(D3DDDI_RATIONAL rates[2]) const
+{
+    rates[0] = GetBaseRefreshRate();
+    if (!m_Allow120 || (ULONGLONG)rates[0].Numerator >= 100ULL * rates[0].Denominator)
+    {
+        return 1;
+    }
+    rates[1].Numerator = 120;
+    rates[1].Denominator = 1;
+    return 2;
+}
+
+D3DDDI_RATIONAL VioGpuVidPN::GetBaseRefreshRate() const
+{
+    // The host display's refresh rate (EDID preferred timing); 60 Hz stands in when the host gave none.
     D3DDDI_RATIONAL rate = m_EdidRefresh;
     if (rate.Numerator == 0 || rate.Denominator == 0)
     {
