@@ -1331,14 +1331,16 @@ NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQ
 
                 // F93: hardware cursor through the virtio-gpu cursor queue (crosvm draws it as its
                 // own layer, so a mouse move no longer costs a DWM recomposition of the screen).
-                // Color (ARGB) and monochrome shapes; a masked-color shape is refused and Windows
-                // draws that one in software. Off with the HWCursor=0 registry value.
+                // Color (ARGB), monochrome and (F95) masked-color shapes; a masked-color shape that
+                // really inverts screen pixels is refused and Windows draws that one in software.
+                // Off with the HWCursor=0 registry value.
                 if (IsPointerEnabled()) {
                     pDriverCaps->MaxPointerWidth = POINTER_SIZE;
                     pDriverCaps->MaxPointerHeight = POINTER_SIZE;
                     pDriverCaps->PointerCaps.Value = 0;
                     pDriverCaps->PointerCaps.Color = 1;
                     pDriverCaps->PointerCaps.Monochrome = 1;
+                    pDriverCaps->PointerCaps.MaskedColor = 1; // F95
                 }
 
                 // Surely this is enough...
@@ -4923,8 +4925,23 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *s)
     if (!IsPointerEnabled() || s->VidPnSourceId != 0 || s->Width > POINTER_SIZE || s->Width == 0)
         return STATUS_UNSUCCESSFUL;
     const UINT h = s->Flags.Monochrome ? s->Height / 2 : s->Height;
-    if (h == 0 || h > POINTER_SIZE || !s->pPixels || (!s->Flags.Color && !s->Flags.Monochrome))
-        return STATUS_UNSUCCESSFUL; // masked color: Windows falls back to a software cursor
+    if (h == 0 || h > POINTER_SIZE || !s->pPixels || (!s->Flags.Color && !s->Flags.Monochrome && !s->Flags.MaskedColor))
+        return STATUS_UNSUCCESSFUL;
+    if (s->Flags.MaskedColor)
+    {
+        // F95: 32 bpp, alpha is the AND mask: 0x00 = replace with RGB, 0xFF = XOR RGB with the screen.
+        // XOR with black is transparent; any real XOR pixel (screen inversion) cannot be shown by an
+        // ARGB cursor plane, so that shape stays a software cursor (STATUS_UNSUCCESSFUL).
+        for (UINT y = 0; y < h; y++)
+        {
+            const ULONG *p = (const ULONG *)((const BYTE *)s->pPixels + (SIZE_T)y * s->Pitch);
+            for (UINT x = 0; x < s->Width; x++)
+            {
+                if ((p[x] >> 24) && (p[x] & 0x00FFFFFFu))
+                    return STATUS_UNSUCCESSFUL;
+            }
+        }
+    }
     if (!CursorEnsure())
         return STATUS_UNSUCCESSFUL;
 
@@ -4939,6 +4956,12 @@ NTSTATUS VioGpuAdapter::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *s)
         if (s->Flags.Color)
         {
             RtlCopyMemory(row, src + (SIZE_T)y * s->Pitch, s->Width * 4);
+        }
+        else if (s->Flags.MaskedColor)
+        {
+            const ULONG *p = (const ULONG *)(src + (SIZE_T)y * s->Pitch);
+            for (UINT x = 0; x < s->Width; x++)
+                row[x] = (p[x] >> 24) ? 0x00000000u : (0xFF000000u | (p[x] & 0x00FFFFFFu));
         }
         else
         {

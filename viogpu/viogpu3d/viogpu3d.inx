@@ -96,7 +96,7 @@ HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,,TypesSupported,%REG_DWORD%,7
 
 [VioGpu3D_DeviceSettings]
-HKR,, HWCursor,                    %REG_DWORD%, 0
+HKR,, HWCursor,                    %REG_DWORD%, 1
 HKR,, FlexResolution,              %REG_DWORD%, 1
 HKR,, UsePhysicalMemory,           %REG_DWORD%, 0
 ; The D3D9 slot is "<>" (dxgkrnl's no-driver token): Windows then serves
