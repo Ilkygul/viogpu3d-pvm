@@ -5097,3 +5097,20 @@ NTSTATUS VioGpuAdapter::SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION
     CursorQueue(VIRTIO_GPU_CMD_MOVE_CURSOR, m_pCursorBuf->GetId(), p->X, p->Y, 0, 0);
     return STATUS_SUCCESS;
 }
+
+// F102: the host window size survives a reboot (Parameters\LastHostSize = w << 16 | h), so the driver can offer it
+// before the host knows it again; see VioGpuVidPN::GetDisplayInfo.
+ULONGLONG VioGpuReadParameter(PCWSTR name, ULONGLONG defaultValue)
+{
+    return ReadQwordParameter(name, defaultValue);
+}
+
+void VioGpuWriteParameter(PCWSTR name, ULONGLONG value)
+{
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+    {
+        return;
+    }
+    RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, L"VioGpu3D\\Parameters", name, REG_QWORD, &value, sizeof(value));
+}
+

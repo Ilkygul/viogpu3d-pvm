@@ -11,6 +11,9 @@ extern "C" NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #include "edid.h"
 #include "trace.h"
 
+ULONGLONG VioGpuReadParameter(PCWSTR name, ULONGLONG defaultValue); // F102, viogpu_adapter.cpp
+void VioGpuWriteParameter(PCWSTR name, ULONGLONG value);
+
 static const LONGLONG kVsyncPeriodFallback100ns = 166666LL; // 60 Hz
 
 // Convert a D3DDDI_RATIONAL refresh rate into a 100ns timer period.
@@ -866,7 +869,20 @@ NTSTATUS VioGpuVidPN::GetModeList(DXGK_DISPLAY_INFORMATION *pDispInfo)
     m_ModeCount = ModeCount;
     DbgPrint(TRACE_LEVEL_INFORMATION, ("ModeCount filtered %d\n", m_ModeCount));
 
-    GetDisplayInfo();
+    if (!GetDisplayInfo())
+    {
+        // F102: the host window is not attached yet (DroidVM reports the size only once its screen is open,
+        // ~1-2 min into the boot). Offer the last host size now, so Windows commits it at boot instead of
+        // switching resolution later while DWM starts: that switch left DWM's backdrop (Start/acrylic) fully
+        // transparent until the next user resolution change. Off: Parameters\BootHostSize=0.
+        const ULONGLONG last = VioGpuReadParameter(L"BootHostSize", 1) ? VioGpuReadParameter(L"LastHostSize", 0) : 0;
+        const USHORT w = (USHORT)(last >> 16), h = (USHORT)(last & 0xFFFF);
+        if (w >= MIN_WIDTH_SIZE && h >= MIN_HEIGHT_SIZE && w <= 7680 && h <= 4320)
+        {
+            SetCustomDisplay(w, h);
+            VioGpuRegLog("F102: host size unknown at start, offering last host size %ux%u\n", w, h);
+        }
+    }
 
     for (UINT idx = 0; idx < ModeCount; idx++)
     {
@@ -2037,6 +2053,14 @@ BOOLEAN VioGpuVidPN::GetDisplayInfo(void)
             {
                 DbgPrint(TRACE_LEVEL_FATAL, ("---> %s scanout %u (%lux%lu)\n", __FUNCTION__, i, xres, yres));
                 SetCustomDisplay((USHORT)xres, (USHORT)yres);
+                if (i == 0 && xres <= 0xFFFF && yres <= 0xFFFF)
+                {
+                    const ULONGLONG size = ((ULONGLONG)xres << 16) | yres;
+                    if (VioGpuReadParameter(L"LastHostSize", 0) != size)
+                    {
+                        VioGpuWriteParameter(L"LastHostSize", size);   // F102
+                    }
+                }
                 have = TRUE;
             }
         }
