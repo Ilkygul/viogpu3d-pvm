@@ -1123,7 +1123,7 @@ void VioGpuAllocation::FlushToScreen(UINT scan_id)
                              scan_id, m_Id, info.width, info.height, info.format, info.strides[0]);
             }
         }
-        m_adapter->ctrlQueue.SetScanoutBlob(scan_id, m_Id, rect, info);
+        m_adapter->ctrlQueue.SetScanoutBlob(scan_id, m_Id, rect, info, !m_adapter->vidpn.m_flipSingleKick);
         // TODO: guard with IsGuest()
         m_adapter->ctrlQueue.ResFlush(m_Id, rect);
     } else {

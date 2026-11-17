@@ -110,6 +110,9 @@ class VioGpuVidPN
                             _In_ INT PositionY);
 
     void Flip();
+    // F101: dxgkrnl's ControlInterrupt(CRTC_VSYNC) and the live switches (re-read by the flip thread).
+    void OnControlInterrupt(BOOLEAN vsync, BOOLEAN enable);
+    void ReloadSwitches();
     static void FlipThread(void *ctx);
 
     // How long an armed flip may wait for its render dependency before it is
@@ -336,6 +339,20 @@ class VioGpuVidPN
     LONGLONG m_lastFlushedAddr = 0;
     volatile LONG m_bltRearm = 0;
     volatile LONG m_flipDedupSkips = 0;
+    // F101 FlipLog with times: [0] tick->present, [1] present->promote (token back); bins 2,4,6,8,10,12,16,>16 ms.
+    volatile LONG m_flipHist[2][8] = {};
+    ULONGLONG m_lastTick = 0;
+    volatile LONG m_vsyncWanted = 1;
+    volatile LONG m_vsyncOnCalls = 0;
+    volatile LONG m_vsyncOffCalls = 0;
+    volatile LONG m_vsyncStops = 0;
+    volatile LONG m_graceWaits = 0;
+    volatile LONG m_graceHits = 0;
+    BOOLEAN m_vsyncIdleStop = TRUE;
+    ULONG m_vsyncGraceUs = 0;
+  public:
+    BOOLEAN m_flipSingleKick = TRUE;
+  private:
   public:
     void SetFlipDedup(BOOLEAN on) { m_flipDedup = on; }
   private:

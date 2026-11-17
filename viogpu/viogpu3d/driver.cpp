@@ -1554,10 +1554,12 @@ VioGpu3DDdiControlInterrupt(_In_ CONST HANDLE hAdapter,
 {
     PAGED_CODE();
 
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(InterruptType);
-    UNREFERENCED_PARAMETER(EnableInterrupt);
-
+    // F101: track CRTC_VSYNC enable/disable so the flip thread can stop its timer while nothing is shown.
+    VioGpuAdapter *pAdapter = VioGpuAdapter::FromHandle(hAdapter);
+    if (pAdapter)
+    {
+        pAdapter->vidpn.OnControlInterrupt(InterruptType == DXGK_INTERRUPT_CRTC_VSYNC, EnableInterrupt);
+    }
     return STATUS_SUCCESS;
 };
 

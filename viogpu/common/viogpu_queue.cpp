@@ -1614,7 +1614,7 @@ void CtrlQueue::SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, U
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
-void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info)
+void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info, BOOLEAN kick)
 {
     DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
 
@@ -1640,7 +1640,7 @@ void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_
     }
 
     // FIXME if
-    QueueBuffer(vbuf);
+    QueueBuffer(vbuf, kick);   // F101 1d: the ResFlush that always follows kicks for both
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }

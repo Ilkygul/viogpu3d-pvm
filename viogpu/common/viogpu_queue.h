@@ -365,7 +365,7 @@ class CtrlQueue : public VioGpuQueue
                             void *complete_ctx);
 
     void SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, UINT x, UINT y);
-    void SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info);
+    void SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info, BOOLEAN kick = TRUE);
     void ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y);
     void ResFlush(UINT res_id, GPU_RECT rect) {
 		ResFlush(res_id, rect.width, rect.height, rect.x, rect.y);

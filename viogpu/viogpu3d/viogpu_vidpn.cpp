@@ -2617,11 +2617,18 @@ void VioGpuVidPN::AddCustomMonitorMode(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID Targe
     }
 
     PVIDEO_MODE_INFORMATION pModeInfo = &m_ModeInfo[m_CustomModeIndex];
+    // F101: the host window size in every rate the target offers (60 and 120 Hz), as RecommendMonitorModes
+    // does at boot. Only the base rate here left a runtime resize (screen reopened, Fold unfolded) without
+    // 120 Hz: ChangeDisplaySettings(1848x1768 @120) then failed with BADMODE.
+    D3DDDI_RATIONAL rates[2];
+    const UINT nRates = GetRates(rates);
+    for (UINT r = 0; r < nRates; ++r)
+    {
     D3DKMDT_MONITOR_SOURCE_MODE *pMonitorSourceMode = NULL;
     Status = pMonitorSourceModeSetInterface->pfnCreateNewModeInfo(hMonitorSourceModeSet, &pMonitorSourceMode);
     if (NT_SUCCESS(Status))
     {
-        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pModeInfo);
+        BuildVideoSignalInfo(&pMonitorSourceMode->VideoSignalInfo, pModeInfo, rates[r]);
         pMonitorSourceMode->Origin = D3DKMDT_MCO_DRIVER;
         pMonitorSourceMode->Preference = D3DKMDT_MP_NOTPREFERRED;
         pMonitorSourceMode->ColorBasis = D3DKMDT_CB_SRGB;
@@ -2638,6 +2645,7 @@ void VioGpuVidPN::AddCustomMonitorMode(_In_ D3DDDI_VIDEO_PRESENT_TARGET_ID Targe
             UNREFERENCED_PARAMETER(TempStatus);
             NT_ASSERT(NT_SUCCESS(TempStatus));
         }
+    }
     }
     DbgPrint(TRACE_LEVEL_FATAL,
              ("%s %dx%d Status = 0x%X\n", __FUNCTION__, pModeInfo->VisScreenWidth, pModeInfo->VisScreenHeight, Status));
@@ -2668,6 +2676,8 @@ PAGED_CODE_SEG_END
 // reporting the frame that is really on screen and dxgkrnl neither retires the
 // queued flip nor frees the primary it would displace.  That is what makes it
 // safe for the UMD's present to return immediately.
+extern "C" void VioGpuRegLogFlush(void);
+
 BOOLEAN VioGpuVidPN::TryPromoteFlip()
 {
     // Entered only from the flip thread at PASSIVE_LEVEL: the scanout emitted
@@ -2742,6 +2752,17 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
             {
                 res = p->Res;
                 required = p->Token;
+                // F101: present->promote and tick->present of the flip that scans out now.
+                {
+                    static const ULONGLONG lim[7] = {20000, 40000, 60000, 80000, 100000, 120000, 160000};
+                    const ULONGLONG d1 = now - p->ArmedAt;
+                    const ULONGLONG d0 = (m_lastTick && p->ArmedAt > m_lastTick) ? p->ArmedAt - m_lastTick : 0;
+                    ULONG b0 = 7, b1 = 7;
+                    for (ULONG k = 0; k < 7; k++) { if (d0 < lim[k]) { b0 = k; break; } }
+                    for (ULONG k = 0; k < 7; k++) { if (d1 < lim[k]) { b1 = k; break; } }
+                    InterlockedIncrement(&m_flipHist[0][b0]);
+                    InterlockedIncrement(&m_flipHist[1][b1]);
+                }
             }
             else
             {
@@ -2838,11 +2859,24 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
     }
     LONG promotes = InterlockedIncrement(&m_flipPromotes);
     // F99 FlipLog: counters into the registry log every 4096 promotes (about a minute of animation).
-    if ((promotes & 4095) == 0)
+    if ((promotes & 1023) == 0)
     {
-        VioGpuRegLog("fliplog: promotes=%ld gated=%ld ungated=%ld parked=%ld timeouts=%ld flushes=%ld dedup=%ld\n",
+        VioGpuRegLog("fliplog: promotes=%ld gated=%ld ungated=%ld parked=%ld timeouts=%ld flushes=%ld dedup=%ld "
+                     "vsync on/off=%ld/%ld stops=%ld grace waits/hits=%ld/%ld grace=%lu idlestop=%u singlekick=%u\n",
                      promotes, m_flipGatedPromotes, m_flipUngatedPromotes, m_flipParked, m_flipTokenTimeouts,
-                     m_flipFlushes, m_flipDedupSkips);
+                     m_flipFlushes, m_flipDedupSkips, m_vsyncOnCalls, m_vsyncOffCalls, m_vsyncStops, m_graceWaits,
+                     m_graceHits, m_vsyncGraceUs, (UINT)m_vsyncIdleStop, (UINT)m_flipSingleKick);
+        VioGpuRegLog("fliphist tick->present <2,4,6,8,10,12,16,>16 ms: %ld %ld %ld %ld %ld %ld %ld %ld | "
+                     "present->token: %ld %ld %ld %ld %ld %ld %ld %ld\n",
+                     InterlockedExchange(&m_flipHist[0][0], 0), InterlockedExchange(&m_flipHist[0][1], 0),
+                     InterlockedExchange(&m_flipHist[0][2], 0), InterlockedExchange(&m_flipHist[0][3], 0),
+                     InterlockedExchange(&m_flipHist[0][4], 0), InterlockedExchange(&m_flipHist[0][5], 0),
+                     InterlockedExchange(&m_flipHist[0][6], 0), InterlockedExchange(&m_flipHist[0][7], 0),
+                     InterlockedExchange(&m_flipHist[1][0], 0), InterlockedExchange(&m_flipHist[1][1], 0),
+                     InterlockedExchange(&m_flipHist[1][2], 0), InterlockedExchange(&m_flipHist[1][3], 0),
+                     InterlockedExchange(&m_flipHist[1][4], 0), InterlockedExchange(&m_flipHist[1][5], 0),
+                     InterlockedExchange(&m_flipHist[1][6], 0), InterlockedExchange(&m_flipHist[1][7], 0));
+        VioGpuRegLogFlush();
     }
 
     return TRUE;
@@ -2850,6 +2884,7 @@ BOOLEAN VioGpuVidPN::TryPromoteFlip()
 
 void VioGpuVidPN::Flip()
 {
+    m_lastTick = KeQueryInterruptTime();
     TryPromoteFlip();
 
     DXGKARGCB_NOTIFY_INTERRUPT_DATA interrupt = {};
@@ -2942,6 +2977,7 @@ void VioGpuVidPN::FlipThread(void *ctx)
     // restarted after ReleasePostDisplayOwnership, and the previous run
     // cancelled it on exit).
     vidpn->m_vsyncTimerPeriod100ns = 0;
+    ULONG reloadTicks = 240;
 
     for (;;)
     {
@@ -2962,6 +2998,32 @@ void VioGpuVidPN::FlipThread(void *ctx)
         // rate the mode advertises, and a cadence off by a few percent
         // (120 Hz programmed as 8 ms is 125 Hz) drifts against it.  A
         // high-resolution timer's due time must be relative.
+        // F101: live switches every ~2 s (the thread is at PASSIVE_LEVEL).
+        if (++reloadTicks >= 240) { reloadTicks = 0; vidpn->ReloadSwitches(); }
+        // F101 1b: dxgkrnl turned vsync interrupts off and nothing is queued -> stop the timer until it asks again
+        // or a flip arrives (both signal m_flipReadyEvent).
+        BOOLEAN pendingFlip;
+        {
+            KIRQL q = vidpn->AcquireSourceLock();
+            pendingFlip = vidpn->m_flipQCount != 0;
+            vidpn->ReleaseSourceLock(q);
+        }
+        if (vidpn->m_vsyncIdleStop && !InterlockedCompareExchange(&vidpn->m_vsyncWanted, 0, 0) && !pendingFlip &&
+            !InterlockedCompareExchange(&vidpn->m_shouldFlip, 0, 0))
+        {
+            if (vidpn->m_vsyncTimerPeriod100ns != 0)
+            {
+                ExCancelTimer(vidpn->m_vsyncTimer, NULL);
+                vidpn->m_vsyncTimerPeriod100ns = 0;
+                InterlockedIncrement(&vidpn->m_vsyncStops);
+            }
+            KeWaitForSingleObject(&vidpn->m_flipReadyEvent, Executive, KernelMode, FALSE, NULL);
+            if (vidpn->m_shouldFlipStop)
+            {
+                break;
+            }
+            continue;
+        }
         LONGLONG period100ns = VsyncPeriodFromRefresh(vidpn->GetActiveRefreshRate());
         if (period100ns != vidpn->m_vsyncTimerPeriod100ns)
         {
@@ -2989,6 +3051,37 @@ void VioGpuVidPN::FlipThread(void *ctx)
         }
         if (wait == STATUS_WAIT_0)
         {
+            // F101 1c: a fenced flip whose token is still out may retire within VsyncGraceUs; report the vsync
+            // after it instead of one whole refresh later.  The timer keeps its fixed rhythm.
+            const ULONG grace = vidpn->m_vsyncGraceUs;
+            if (grace != 0)
+            {
+                BOOLEAN waiting = FALSE;
+                {
+                    KIRQL q = vidpn->AcquireSourceLock();
+                    for (ULONG i = 0; i < vidpn->m_flipQCount; i++)
+                    {
+                        if (!vidpn->m_pAdapter->PresentTokenRetired(
+                                vidpn->m_flipQueue[(vidpn->m_flipQHead + i) % VIOGPU_FLIP_QUEUE_DEPTH].Token))
+                        {
+                            waiting = TRUE;
+                            break;
+                        }
+                    }
+                    vidpn->ReleaseSourceLock(q);
+                }
+                if (waiting)
+                {
+                    InterlockedIncrement(&vidpn->m_graceWaits);
+                    LARGE_INTEGER to;
+                    to.QuadPart = -(LONGLONG)grace * 10;
+                    if (KeWaitForSingleObject(&vidpn->m_flipReadyEvent, Executive, KernelMode, FALSE, &to) ==
+                        STATUS_SUCCESS)
+                    {
+                        InterlockedIncrement(&vidpn->m_graceHits);
+                    }
+                }
+            }
             vidpn->Flip();
         }
         else
@@ -3019,6 +3112,21 @@ void VioGpuVidPN::OnPresentTokenRetired()
     // page out, and executing a paged-out page at DISPATCH bugchecks 0xD1
     // (DRIVER_IRQL_NOT_LESS_OR_EQUAL, Arg1==Arg4 = an execute-from-paged fault).
     KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+}
+
+// F101: ControlInterrupt(CRTC_VSYNC).  Enabling wakes the flip thread so a stopped timer restarts at once.
+void VioGpuVidPN::OnControlInterrupt(BOOLEAN vsync, BOOLEAN enable)
+{
+    if (!vsync)
+    {
+        return;
+    }
+    InterlockedExchange(&m_vsyncWanted, enable ? 1 : 0);
+    InterlockedIncrement(enable ? &m_vsyncOnCalls : &m_vsyncOffCalls);
+    if (enable)
+    {
+        KeSetEvent(&m_flipReadyEvent, IO_NO_INCREMENT, FALSE);
+    }
 }
 
 // NON-PAGED: runs under m_sourceLock at DISPATCH_LEVEL (SetScanoutSource can

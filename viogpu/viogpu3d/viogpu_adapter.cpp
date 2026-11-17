@@ -1210,6 +1210,17 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
 
 static ULONGLONG ReadQwordParameter(PCWSTR name, ULONGLONG defaultValue);
 
+// F101: live switches (Services\viogpu3d\Parameters), read by the flip thread every ~2 s.
+void VioGpuVidPN::ReloadSwitches()
+{
+    PAGED_CODE();
+    m_vsyncIdleStop = ReadQwordParameter(L"VsyncIdleStop", 1) != 0;
+    ULONGLONG g = ReadQwordParameter(L"VsyncGraceUs", 0);
+    m_vsyncGraceUs = (ULONG)(g > 8000 ? 8000 : g);
+    m_flipSingleKick = ReadQwordParameter(L"FlipSingleKick", 1) != 0;
+    m_flipDedup = ReadQwordParameter(L"FlipDedup", 1) != 0;
+}
+
 // F98: the VENUS_HOST pool (host GPU objects mapped into the protected VM) as a memory segment, so Windows
 // counts it as dedicated GPU memory.  CPU-invisible and never named by an allocation's segment set: it only
 // reports capacity.  GPU VA 0x900000000 stays clear of the aperture (0xC0000000), the VidMm pool segment
